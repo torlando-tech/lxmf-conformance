@@ -1,0 +1,82 @@
+name: LXMF Conformance Tests
+
+# Cross-impl conformance check. Runs the LXMF protocol test suite
+# against every (server_impl, client_impl) pair so a regression in
+# any single bridge surfaces against every peer.
+#
+# Phase 1 matrix: python and swift on both sides (4 combos per test).
+# Phase 2 will add kotlin once the kotlin bridge implementation lands.
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+
+jobs:
+  conformance:
+    # macOS: Swift 5.9+ is preinstalled on macos-14 runners and the
+    # swift bridge build uses CryptoKit which requires Apple platforms.
+    # macOS-14 also runs the python side comfortably (markqvist/LXMF
+    # has no Linux-only deps).
+    runs-on: macos-14
+    timeout-minutes: 25
+
+    steps:
+      - name: Checkout lxmf-conformance
+        uses: actions/checkout@v4
+        with:
+          path: lxmf-conformance
+
+      - name: Checkout LXMF-swift
+        uses: actions/checkout@v4
+        with:
+          repository: torlando-tech/LXMF-swift
+          path: LXMF-swift
+
+      - name: Checkout Reticulum (Python reference)
+        uses: actions/checkout@v4
+        with:
+          repository: markqvist/Reticulum
+          path: Reticulum
+
+      - name: Checkout LXMF (Python reference)
+        uses: actions/checkout@v4
+        with:
+          repository: markqvist/LXMF
+          path: LXMF
+
+      - name: Set up Python 3.12
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Install Python deps
+        # We pull pytest from PyPI but route Reticulum + LXMF through
+        # the source checkouts above (PYTHON_RNS_PATH / PYTHON_LXMF_PATH
+        # in the test env). The bridge prepends those paths to sys.path
+        # before importing, so the in-tree code wins over any
+        # pip-installed copy.
+        run: |
+          python -m pip install --upgrade pip
+          # Install the runtime deps that markqvist/LXMF and Reticulum
+          # need at import time (cryptography, etc). pyproject toml
+          # entries for those repos cover their own deps.
+          pip install pytest cryptography pyserial msgpack
+
+      - name: Build LXMF-swift conformance bridge
+        working-directory: LXMF-swift
+        # Release mode for parity with how the swift bridge will run
+        # in production-equivalent benchmarks; debug also works.
+        run: swift build -c release --product LXMFConformanceBridge
+
+      - name: Run cross-impl conformance tests
+        working-directory: lxmf-conformance
+        env:
+          PYTHON_RNS_PATH: ${{ github.workspace }}/Reticulum
+          PYTHON_LXMF_PATH: ${{ github.workspace }}/LXMF
+          # Pin the swift bridge path so conftest.py auto-detection
+          # doesn't depend on relative-path conventions inside the
+          # GitHub Actions checkout layout.
+          CONFORMANCE_SWIFT_BRIDGE_CMD: ${{ github.workspace }}/LXMF-swift/.build/release/LXMFConformanceBridge
+        run: python -m pytest tests/ -v --tb=short

@@ -1,0 +1,10 @@
+pytest>=8.0
+# RNS and LXMF can be installed two ways:
+#   1. pip install rns lxmf  — uses the published PyPI packages.
+#   2. PYTHON_RNS_PATH and PYTHON_LXMF_PATH env vars pointing at
+#      checked-out source trees. The reference bridge prepends those
+#      paths to sys.path so the in-repo packages win over any
+#      pip-installed copy. CI uses option (2) to test against the
+#      tip-of-main markqvist repos.
+rns>=0.9
+lxmf>=0.7

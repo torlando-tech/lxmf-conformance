@@ -1,0 +1,28 @@
+[project]
+name = "lxmf-conformance"
+version = "0.1.0"
+description = "Cross-implementation conformance test suite for LXMF (Python, Swift, Kotlin)."
+readme = "README.md"
+requires-python = ">=3.11"
+license = { text = "MIT" }
+dependencies = [
+    "pytest>=8.0",
+    "rns>=0.9",
+    "lxmf>=0.7",
+]
+
+[project.urls]
+Homepage = "https://github.com/torlando-tech/lxmf-conformance"
+Repository = "https://github.com/torlando-tech/lxmf-conformance"
+
+[build-system]
+requires = ["setuptools>=61.0"]
+build-backend = "setuptools.build_meta"
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+# Bridges spawn subprocesses + threads that take a few seconds to wire
+# up; bumping the default timeout gives the announce-discovery test
+# room to converge on slow CI without hiding a hung bridge.
+timeout = 60
+addopts = "-ra"
