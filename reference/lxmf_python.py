@@ -60,6 +60,38 @@ import RNS  # noqa: E402  -- after path setup
 import LXMF  # noqa: E402
 
 # --------------------------------------------------------------------------- #
+# Stamp generation: force single-process path.
+#
+# LXStamper.generate_stamp() dispatches by platform and on Linux uses
+# multiprocessing.Process workers (job_linux). In a bridge subprocess
+# launched by pytest those workers hang indefinitely — they inherit FDs
+# and signal masks that confuse the manager, and the bridge never sees
+# the stamp result. job_simple() is the upstream-blessed single-process
+# fallback (LXStamper.py:145, "should work on any platform, used as a
+# fall-back, in case of limited multi-processing"). Cost-12 stamps take
+# < 1s here, well under any test timeout, so we don't need parallelism.
+# --------------------------------------------------------------------------- #
+import LXMF.LXStamper as _LXStamper  # noqa: E402
+
+
+def _generate_stamp_single_process(message_id, stamp_cost,
+                                   expand_rounds=_LXStamper.WORKBLOCK_EXPAND_ROUNDS):
+    workblock = _LXStamper.stamp_workblock(message_id, expand_rounds=expand_rounds)
+    start_time = time.time()
+    stamp, rounds = _LXStamper.job_simple(stamp_cost, workblock, message_id)
+    duration = time.time() - start_time
+    value = _LXStamper.stamp_value(workblock, stamp) if stamp is not None else 0
+    RNS.log(
+        f"[bridge] Single-process stamp value={value} in "
+        f"{RNS.prettytime(duration)}, {rounds} rounds",
+        RNS.LOG_DEBUG,
+    )
+    return stamp, value
+
+
+_LXStamper.generate_stamp = _generate_stamp_single_process
+
+# --------------------------------------------------------------------------- #
 # Bridge state
 # --------------------------------------------------------------------------- #
 
