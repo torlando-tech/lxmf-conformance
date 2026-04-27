@@ -339,6 +339,54 @@ def cmd_lxmf_init(params):
     return result
 
 
+def _apply_default_interface_attrs(iface):
+    """Mirror the attrs that `RNS.Reticulum.interface_post_init` normally sets.
+
+    The bridge constructs interfaces directly via the TCP{Client,Server}Interface
+    constructors instead of going through Reticulum's config-file parser, which
+    means the standard `interface_post_init` defaults never get applied. RNS
+    Transport later assumes those attrs exist (`announce_rate_target`,
+    `announce_cap`, `mode`, `ifac_size`, etc.) — a missing attr fires
+    `AttributeError` deep inside Transport's announce/forward path. The
+    visible failure mode is a TCPInterface that keeps reconnecting (the
+    AttributeError gets caught by Transport's interface error handler) and
+    LXMF outbound messages parking at `state='outbound'` because their
+    underlying link establishment can't traverse the broken interface.
+
+    This function applies the same defaults `interface_post_init` does for
+    a plain `[interfaces] [[Name]]` block with no extra options.
+    """
+    from RNS.Interfaces.Interface import Interface
+
+    iface.mode = Interface.MODE_FULL
+    iface.announce_cap = RNS.Reticulum.ANNOUNCE_CAP / 100.0
+    iface.bootstrap_only = False
+    iface.optimise_mtu()
+    iface.ifac_size = iface.DEFAULT_IFAC_SIZE
+    iface.discoverable = False
+    iface.discovery_announce_interval = None
+    iface.discovery_publish_ifac = False
+    iface.reachable_on = None
+    iface.discovery_name = None
+    iface.discovery_encrypt = False
+    iface.discovery_stamp_value = None
+    iface.discovery_latitude = None
+    iface.discovery_longitude = None
+    iface.discovery_height = None
+    iface.discovery_frequency = None
+    iface.discovery_bandwidth = None
+    iface.discovery_modulation = None
+    iface.announce_rate_target = None
+    iface.announce_rate_grace = None
+    iface.announce_rate_penalty = None
+    iface.ingress_control = True
+    iface.ifac_netname = None
+    iface.ifac_netkey = None
+    iface.ifac_signature = None
+    iface.ifac_key = None
+    iface.ifac_identity = None
+
+
 def cmd_lxmf_add_tcp_server_interface(params):
     """Attach a TCPServerInterface listening on loopback.
 
@@ -382,6 +430,7 @@ def cmd_lxmf_add_tcp_server_interface(params):
     }
     iface = TCPServerInterface(RNS.Transport, iface_config)
     iface.OUT = True
+    _apply_default_interface_attrs(iface)
     _state.reticulum._add_interface(iface)
     _state._interfaces.append(iface)
 
@@ -420,6 +469,7 @@ def cmd_lxmf_add_tcp_client_interface(params):
     }
     iface = TCPClientInterface(RNS.Transport, iface_config)
     iface.OUT = True
+    _apply_default_interface_attrs(iface)
     _state.reticulum._add_interface(iface)
     _state._interfaces.append(iface)
 
