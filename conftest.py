@@ -161,6 +161,17 @@ def pytest_generate_tests(metafunc):
             ("server_impl", "client_impl"), pairs, ids=ids, scope="function"
         )
 
+    # tcp_trio tests opt in via `sender_impl` + `receiver_impl`. The
+    # propagation-node role is always python — swift LXMF doesn't host
+    # propagation nodes (`router.enable_propagation()` is python-only).
+    if "sender_impl" in metafunc.fixturenames and "receiver_impl" in metafunc.fixturenames:
+        impls = get_active_impls(metafunc.config)
+        pairs = [(s, r) for s in impls for r in impls]
+        ids = [f"{s}->python_pn->{r}" for s, r in pairs]
+        metafunc.parametrize(
+            ("sender_impl", "receiver_impl"), pairs, ids=ids, scope="function"
+        )
+
 
 @pytest.fixture
 def server_impl(request):
@@ -172,6 +183,18 @@ def server_impl(request):
 def client_impl(request):
     """Client-role impl name. Set by parametrization."""
     return request.param if hasattr(request, "param") else request.node.callspec.params["client_impl"]
+
+
+@pytest.fixture
+def sender_impl(request):
+    """Sender-role impl name in 3-bridge propagation topology."""
+    return request.param if hasattr(request, "param") else request.node.callspec.params["sender_impl"]
+
+
+@pytest.fixture
+def receiver_impl(request):
+    """Receiver-role impl name in 3-bridge propagation topology."""
+    return request.param if hasattr(request, "param") else request.node.callspec.params["receiver_impl"]
 
 
 @pytest.fixture
@@ -293,6 +316,167 @@ def pipe_pair(server_impl, client_impl):
                 pass
 
 
+@pytest.fixture
+def tcp_trio(sender_impl, receiver_impl):
+    """Three LXMF bridges connected via TCP loopback in a star.
+
+    Topology:
+
+        sender (TCPClient)  ──┐
+                               ├─→ propagation_node (TCPServer, python)
+        receiver (TCPClient) ──┘
+
+    The propagation_node role is always **python** — swift LXMF does
+    not implement `enable_propagation()` (the in-process propagation
+    daemon is python-only; production deployments run lxmd as a
+    separate subprocess but bringing that into the test surface
+    requires shared-instance machinery the bridges don't currently
+    expose). Sender and receiver are parametrized over every
+    detected impl, so a 2-impl detector (python, swift) yields 4
+    `(sender, receiver)` trios.
+
+    Sequence:
+      1. Spawn three bridges.
+      2. PN: `lxmf_init(enable_propagation_node=True)` —
+         publishes `lxmf:propagation` and returns the propagation
+         destination hash.
+      3. PN: `lxmf_add_tcp_server_interface` — returns the bound port.
+      4. Sender + receiver each: `lxmf_init`, then
+         `lxmf_add_tcp_client_interface(target_port=port)`.
+      5. PN announces propagation; sender + receiver announce their
+         delivery destinations. We settle for path convergence.
+      6. Sender: `lxmf_set_outbound_propagation_node(pn_hash)`.
+    """
+    import time
+
+    sender_cmd = resolve_bridge_command(sender_impl)
+    receiver_cmd = resolve_bridge_command(receiver_impl)
+    pn_cmd = resolve_bridge_command("python")
+
+    sender_bridge = None
+    receiver_bridge = None
+    pn_bridge = None
+
+    try:
+        pn_bridge = BridgeClient(pn_cmd, env=_env_for_impl("python"))
+        sender_bridge = BridgeClient(sender_cmd, env=_env_for_impl(sender_impl))
+        receiver_bridge = BridgeClient(receiver_cmd, env=_env_for_impl(receiver_impl))
+
+        pn_init = pn_bridge.execute(
+            "lxmf_init",
+            display_name="conformance-pn",
+            enable_propagation_node=True,
+        )
+        if "propagation_destination_hash" not in pn_init:
+            raise RuntimeError(
+                "PN bridge did not return propagation_destination_hash; "
+                "either enable_propagation_node failed or the python "
+                "bridge is out of date."
+            )
+
+        sender_init = sender_bridge.execute(
+            "lxmf_init", display_name=f"sender-{sender_impl}"
+        )
+        receiver_init = receiver_bridge.execute(
+            "lxmf_init", display_name=f"receiver-{receiver_impl}"
+        )
+
+        # PN binds first so the clients have a port to dial.
+        pn_iface = pn_bridge.execute(
+            "lxmf_add_tcp_server_interface", name="pnlistener"
+        )
+        listener_port = int(pn_iface["port"])
+
+        sender_bridge.execute(
+            "lxmf_add_tcp_client_interface",
+            target_host="127.0.0.1",
+            target_port=listener_port,
+            name="sender_to_pn",
+        )
+        receiver_bridge.execute(
+            "lxmf_add_tcp_client_interface",
+            target_host="127.0.0.1",
+            target_port=listener_port,
+            name="receiver_to_pn",
+        )
+        time.sleep(1.5)
+
+        # Sender + receiver announce their delivery destinations so
+        # the PN learns about them. PN's `lxmf_announce` also fires
+        # `announce_propagation_node()` so the lxmf:propagation
+        # destination lands in sender + receiver path tables — without
+        # that, swift's outbound thread observes `hasPath=false` for
+        # the PN and the message never leaves `outbound`.
+        for _ in range(2):
+            pn_bridge.execute("lxmf_announce")
+            time.sleep(0.4)
+            sender_bridge.execute("lxmf_announce")
+            time.sleep(0.4)
+            receiver_bridge.execute("lxmf_announce")
+            time.sleep(0.4)
+
+        pn_hash = bytes.fromhex(pn_init["propagation_destination_hash"])
+        # 3-bridge transport-mode topologies converge slower than the
+        # 2-bridge direct pair: announces have to traverse spawned
+        # peers, transport-mode forwarding has its own bandwidth caps,
+        # and stamp generation work on the sender side adds even more
+        # latency to the first propagation send. A fixed 8s settle is
+        # generous enough that running multiple `tcp_trio` fixtures in
+        # sequence stays deterministic.
+        time.sleep(8.0)
+
+        # Pin the stamp cost the PN actually requires (PROPAGATION_COST
+        # in LXMF, with PROPAGATION_COST_MIN=13 floor). Without this the
+        # sender's outbound stamp generation falls back to "no work"
+        # (32 random bytes) and the PN rejects the upload as low-stamp.
+        pn_stamp_cost = int(pn_init.get("propagation_stamp_cost", 0))
+        sender_bridge.execute(
+            "lxmf_set_outbound_propagation_node",
+            destination_hash=pn_hash.hex(),
+            stamp_cost=pn_stamp_cost,
+        )
+        receiver_bridge.execute(
+            "lxmf_set_outbound_propagation_node",
+            destination_hash=pn_hash.hex(),
+            stamp_cost=pn_stamp_cost,
+        )
+
+        sender = _BridgeNode(
+            bridge=sender_bridge,
+            impl=sender_impl,
+            identity_hash=bytes.fromhex(sender_init["identity_hash"]),
+            delivery_hash=bytes.fromhex(sender_init["delivery_destination_hash"]),
+        )
+        pn = _BridgeNode(
+            bridge=pn_bridge,
+            impl="python",
+            identity_hash=bytes.fromhex(pn_init["identity_hash"]),
+            delivery_hash=bytes.fromhex(pn_init["delivery_destination_hash"]),
+        )
+        pn.propagation_hash = pn_hash
+        receiver = _BridgeNode(
+            bridge=receiver_bridge,
+            impl=receiver_impl,
+            identity_hash=bytes.fromhex(receiver_init["identity_hash"]),
+            delivery_hash=bytes.fromhex(receiver_init["delivery_destination_hash"]),
+        )
+
+        yield sender, pn, receiver
+
+    finally:
+        for bridge in (receiver_bridge, sender_bridge, pn_bridge):
+            if bridge is None:
+                continue
+            try:
+                bridge.execute("lxmf_shutdown")
+            except Exception:
+                pass
+            try:
+                bridge.close()
+            except Exception:
+                pass
+
+
 class _BridgeNode:
     """Test-side wrapper around a BridgeClient + LXMF metadata.
 
@@ -343,6 +527,29 @@ class _BridgeNode:
             params["fields"] = fields
         result = self.bridge.execute("lxmf_send_direct", **params)
         return bytes.fromhex(result["message_hash"])
+
+    def send_propagated(self, recipient_hash, content, title="", fields=None):
+        """Send PROPAGATED LXMF via the configured outbound propagation
+        node; returns the message hash."""
+        params = {
+            "destination_hash": recipient_hash.hex(),
+            "content": content,
+            "title": title,
+        }
+        if fields is not None:
+            params["fields"] = fields
+        result = self.bridge.execute("lxmf_send_propagated", **params)
+        return bytes.fromhex(result["message_hash"])
+
+    def sync_inbound(self, timeout_sec=30.0):
+        """Pull queued messages from the configured propagation node.
+
+        Blocks until the transfer completes (or times out). Returns
+        the bridge's reported `final_state` string so tests can assert
+        on it; the actual messages land in the regular inbox via the
+        delivery callback and are observable via `drain_received`.
+        """
+        return self.bridge.execute("lxmf_sync_inbound", timeout_sec=timeout_sec)
 
     def drain_received(self):
         """Return all received messages since last drain."""

@@ -227,15 +227,20 @@ def cmd_lxmf_init(params):
     # Write a minimal Reticulum config BEFORE constructing RNS.Reticulum.
     # The defaults RNS auto-generates set ``share_instance = Yes`` which
     # binds a LocalServerInterface on port 37428 — running two bridges
-    # in the same test would collide on that port. We disable both
-    # share_instance and enable_transport (endpoint-only role) and add
-    # no interfaces — those are added programmatically via
-    # cmd_lxmf_add_pipe_interface so the test harness owns the topology.
+    # in the same test would collide on that port. We disable
+    # share_instance unconditionally and only flip enable_transport on
+    # for propagation-node bridges so the PN can forward announces
+    # between sender + receiver in a 3-bridge topology (without that,
+    # the sender's `RNS.Identity.recall(receiver_dest)` returns None
+    # and PROPAGATED send fails).
     config_file = os.path.join(config_dir, "config")
+    enable_transport = (
+        "Yes" if params.get("enable_propagation_node") else "No"
+    )
     with open(config_file, "w") as f:
         f.write(
             "[reticulum]\n"
-            "  enable_transport = No\n"
+            f"  enable_transport = {enable_transport}\n"
             "  share_instance = No\n"
             "  respond_to_probes = No\n"
             "\n"
@@ -297,6 +302,19 @@ def cmd_lxmf_init(params):
 
     router.register_delivery_callback(delivery_callback)
 
+    # Optional: bring this LXMF router up as a propagation node. Tests
+    # that want a 3-bridge sender→PN→receiver topology spawn the middle
+    # bridge with `enable_propagation_node=True`; the router announces
+    # `lxmf:propagation` so the other bridges can discover it via path
+    # convergence and target it with `lxmf_set_outbound_propagation_node`.
+    propagation_destination_hash_hex = None
+    if params.get("enable_propagation_node"):
+        router.enable_propagation()
+        # `enable_propagation` already triggers an initial announce of
+        # the propagation destination, so a subsequent
+        # `lxmf_announce` is unnecessary on the PN side.
+        propagation_destination_hash_hex = router.propagation_destination.hash.hex()
+
     _state.reticulum = reticulum
     _state.config_dir = config_dir
     _state.identity = identity
@@ -304,12 +322,21 @@ def cmd_lxmf_init(params):
     _state.delivery_destination = delivery_destination
     _state.storage_path = storage_path
 
-    return {
+    result = {
         "identity_hash": identity.hash.hex(),
         "delivery_destination_hash": delivery_destination.hash.hex(),
         "config_dir": config_dir,
         "storage_path": storage_path,
     }
+    if propagation_destination_hash_hex is not None:
+        result["propagation_destination_hash"] = propagation_destination_hash_hex
+        # PROPAGATION_COST_MIN floor is 13 in LXMRouter; tests need this
+        # to set the sender's outbound stamp cost so the PN won't reject
+        # an inbound LXM as low-stamp.
+        result["propagation_stamp_cost"] = int(
+            getattr(_state.router, "propagation_stamp_cost", 0) or 0
+        )
+    return result
 
 
 def cmd_lxmf_add_tcp_server_interface(params):
@@ -435,6 +462,14 @@ def cmd_lxmf_announce(params):
         raise RuntimeError("lxmf_init must be called before lxmf_announce")
 
     _state.router.announce(_state.delivery_destination.hash)
+    # If this bridge is also a propagation node, re-announce the
+    # propagation destination so peers learn the path. The initial
+    # announce fired at `enable_propagation()` time goes out before
+    # any test interface is attached, so without this nudge, sender
+    # bridges in a 3-node `tcp_trio` topology would never learn the
+    # propagation node's path.
+    if getattr(_state.router, "propagation_node", False):
+        _state.router.announce_propagation_node()
     return {"delivery_destination_hash": _state.delivery_destination.hash.hex()}
 
 
@@ -606,6 +641,161 @@ def cmd_lxmf_send_direct(params):
             _state._outbound_state[msg_hash] = _state_to_string(message.state)
 
     return {"message_hash": msg_hash.hex()}
+
+
+def cmd_lxmf_has_path(params):
+    """Return whether RNS has a path entry for `destination_hash`.
+
+    Useful in 3-bridge fixtures so the test setup can poll for path
+    convergence before issuing a propagation send/sync — otherwise a
+    race between announce propagation and the test asking the router
+    to do work surfaces as `noPath` even though everything is wired
+    correctly.
+    """
+    if _state.router is None:
+        raise RuntimeError("lxmf_init must be called before lxmf_has_path")
+    dest_hash = bytes.fromhex(params["destination_hash"])
+    # Mirrors what the bridge's send commands need: the destination's
+    # identity must be recallable (so we can encrypt to it). RNS may
+    # have a path-table entry without a recallable identity for
+    # transit destinations, but for the destinations we send to in
+    # tests, the announce delivers both.
+    return {"has_path": RNS.Identity.recall(dest_hash) is not None}
+
+
+def cmd_lxmf_set_outbound_propagation_node(params):
+    """Configure this peer's outbound propagation node.
+
+    The hash is the propagation destination hash that the propagation
+    node bridge returned from `lxmf_init` (when started with
+    `enable_propagation_node=true`). Once set, `lxmf_send_propagated`
+    will route messages through that node.
+
+    params:
+        destination_hash (hex): 16-byte propagation destination hash.
+    """
+    if _state.router is None:
+        raise RuntimeError(
+            "lxmf_init must be called before lxmf_set_outbound_propagation_node"
+        )
+    dest_hash = bytes.fromhex(params["destination_hash"])
+    _state.router.set_outbound_propagation_node(dest_hash)
+    # Optionally pin the outbound stamp cost LXMF uses when uploading to
+    # this propagation node. Without this, the bridge falls back on
+    # whatever the announce-driven discovery has cached, which may be 0
+    # in test fixtures where the PN's announce hasn't yet round-tripped.
+    if "stamp_cost" in params:
+        cost = int(params["stamp_cost"])
+        _state.router.outbound_stamp_costs[dest_hash] = (time.time(), cost)
+    return {"ok": True}
+
+
+def cmd_lxmf_send_propagated(params):
+    """Submit an LXMF message via the configured propagation node.
+
+    Same param shape as opportunistic / direct. The router queues the
+    message with `desired_method=PROPAGATED`; once a path to the
+    outbound propagation node is known the LXM is uploaded to the node
+    and stored there until the recipient syncs.
+
+    Returns the message hash like the other send commands. The state
+    transitions through SENDING → SENT (uploaded to PN) → and stays
+    there from the sender's POV — there is no ack from the recipient
+    on the PROPAGATED path until they sync.
+    """
+    if _state.router is None:
+        raise RuntimeError("lxmf_init must be called before lxmf_send_propagated")
+
+    dest_hash_hex = params["destination_hash"]
+    content = params["content"]
+    title = params.get("title", "")
+    fields = _decode_fields_param(params.get("fields"))
+
+    dest_hash = bytes.fromhex(dest_hash_hex)
+    recipient_identity = RNS.Identity.recall(dest_hash)
+    if recipient_identity is None:
+        raise RuntimeError(
+            f"No identity known for destination {dest_hash_hex}. The "
+            f"recipient must announce its delivery destination before "
+            f"this peer can send to it."
+        )
+
+    recipient_destination = RNS.Destination(
+        recipient_identity,
+        RNS.Destination.OUT,
+        RNS.Destination.SINGLE,
+        "lxmf",
+        "delivery",
+    )
+
+    def state_callback(msg):
+        if msg.hash:
+            with _state._outbound_lock:
+                _state._outbound_state[msg.hash] = _state_to_string(msg.state)
+
+    message = LXMF.LXMessage(
+        destination=recipient_destination,
+        source=_state.delivery_destination,
+        content=content,
+        title=title,
+        fields=fields,
+        desired_method=LXMF.LXMessage.PROPAGATED,
+    )
+    message.register_delivery_callback(state_callback)
+    message.register_failed_callback(state_callback)
+    _state.router.handle_outbound(message)
+
+    msg_hash = message.hash if message.hash else b""
+    if msg_hash:
+        with _state._outbound_lock:
+            _state._outbound_state[msg_hash] = _state_to_string(message.state)
+    return {"message_hash": msg_hash.hex()}
+
+
+def cmd_lxmf_sync_inbound(params):
+    """Block until a propagation-node sync finishes (or times out).
+
+    Issues `request_messages_from_propagation_node` and polls the
+    router's propagation transfer state until the transfer is
+    quiescent or the timeout elapses. The returned status string is
+    the final propagation transfer state — tests assert on it
+    plus the inbox having received the messages.
+
+    params:
+        timeout_sec (number, optional): how long to wait before
+            giving up. Defaults to 30s — propagation sync includes
+            a link establishment + LXMF resource transfer round
+            trip, plus the propagation node's per-peer sync window.
+    """
+    if _state.router is None:
+        raise RuntimeError("lxmf_init must be called before lxmf_sync_inbound")
+    timeout_sec = float(params.get("timeout_sec", 30.0))
+
+    # `request_messages_from_propagation_node` takes the recipient
+    # identity (we are the recipient on this side). max_messages=0
+    # leaves the cap at the LXMF default; tests don't need to
+    # constrain it.
+    _state.router.request_messages_from_propagation_node(_state.identity)
+
+    # Poll the router's propagation transfer state. The states we
+    # treat as terminal: 0 (idle/done), -1 (failed). LXMF uses
+    # PR_IDLE = 0 by default; transient states during transfer are
+    # > 0. We bail on the first idle state seen after the request.
+    deadline = time.time() + timeout_sec
+    final_state = None
+    while time.time() < deadline:
+        final_state = getattr(_state.router, "propagation_transfer_state", None)
+        if final_state in (None, 0, -1):
+            # Sleep a bit so an in-flight transfer that hasn't yet
+            # raised its state has a chance to be observed.
+            time.sleep(0.5)
+            final_state = getattr(_state.router, "propagation_transfer_state", None)
+            break
+        time.sleep(0.2)
+
+    return {
+        "final_state": final_state if final_state is not None else 0,
+    }
 
 
 def cmd_lxmf_get_received_messages(params):
@@ -800,6 +990,10 @@ COMMANDS = {
     "lxmf_announce": cmd_lxmf_announce,
     "lxmf_send_opportunistic": cmd_lxmf_send_opportunistic,
     "lxmf_send_direct": cmd_lxmf_send_direct,
+    "lxmf_has_path": cmd_lxmf_has_path,
+    "lxmf_set_outbound_propagation_node": cmd_lxmf_set_outbound_propagation_node,
+    "lxmf_send_propagated": cmd_lxmf_send_propagated,
+    "lxmf_sync_inbound": cmd_lxmf_sync_inbound,
     "lxmf_get_received_messages": cmd_lxmf_get_received_messages,
     "lxmf_get_message_state": cmd_lxmf_get_message_state,
     "lxmf_shutdown": cmd_lxmf_shutdown,
