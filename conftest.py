@@ -21,6 +21,7 @@ import warnings
 
 import pytest
 
+from _lxmd_pn import LxmdPropagationNode
 from bridge_client import BridgeClient
 
 # Bridge command templates. Each accepts a ``{root}`` placeholder for
@@ -162,12 +163,15 @@ def pytest_generate_tests(metafunc):
         )
 
     # tcp_trio tests opt in via `sender_impl` + `receiver_impl`. The
-    # propagation-node role is always python — swift LXMF doesn't host
-    # propagation nodes (`router.enable_propagation()` is python-only).
+    # propagation-node role is now a real `lxmd` subprocess (see
+    # `_lxmd_pn.LxmdPropagationNode`). Previously we ran the PN as a
+    # python bridge with `router.enable_propagation()`; that path is
+    # plumbed but not the production code path and didn't reliably
+    # ship messages even for the all-python trio.
     if "sender_impl" in metafunc.fixturenames and "receiver_impl" in metafunc.fixturenames:
         impls = get_active_impls(metafunc.config)
         pairs = [(s, r) for s in impls for r in impls]
-        ids = [f"{s}->python_pn->{r}" for s, r in pairs]
+        ids = [f"{s}->lxmd_pn->{r}" for s, r in pairs]
         metafunc.parametrize(
             ("sender_impl", "receiver_impl"), pairs, ids=ids, scope="function"
         )
@@ -318,61 +322,56 @@ def pipe_pair(server_impl, client_impl):
 
 @pytest.fixture
 def tcp_trio(sender_impl, receiver_impl):
-    """Three LXMF bridges connected via TCP loopback in a star.
+    """Sender + receiver bridges talking to a real `lxmd` propagation node.
 
     Topology:
 
-        sender (TCPClient)  ──┐
-                               ├─→ propagation_node (TCPServer, python)
+        sender (TCPClient)   ──┐
+                                ├─→ lxmd --propagation-node (TCPServer)
         receiver (TCPClient) ──┘
 
-    The propagation_node role is always **python** — swift LXMF does
-    not implement `enable_propagation()` (the in-process propagation
-    daemon is python-only; production deployments run lxmd as a
-    separate subprocess but bringing that into the test surface
-    requires shared-instance machinery the bridges don't currently
-    expose). Sender and receiver are parametrized over every
-    detected impl, so a 2-impl detector (python, swift) yields 4
-    `(sender, receiver)` trios.
+    The propagation-node role is a real ``lxmd`` subprocess managed by
+    :class:`_lxmd_pn.LxmdPropagationNode`, not a python bridge with
+    ``router.enable_propagation()``. lxmd is what production
+    deployments actually run; the in-process path was plumbed in the
+    bridge for exposition, but in practice it didn't reliably ship
+    messages from the bridge sender to a recipient on the same trio
+    (even ``(python, python_pn, python)`` parked at ``state='outbound'``
+    for 30+ seconds, see commit message).
+
+    Sender and receiver remain parametrized over every detected impl,
+    so a 2-impl detector (python, kotlin) yields 4 trios.
 
     Sequence:
-      1. Spawn three bridges.
-      2. PN: `lxmf_init(enable_propagation_node=True)` —
-         publishes `lxmf:propagation` and returns the propagation
-         destination hash.
-      3. PN: `lxmf_add_tcp_server_interface` — returns the bound port.
-      4. Sender + receiver each: `lxmf_init`, then
-         `lxmf_add_tcp_client_interface(target_port=port)`.
-      5. PN announces propagation; sender + receiver announce their
-         delivery destinations. We settle for path convergence.
-      6. Sender: `lxmf_set_outbound_propagation_node(pn_hash)`.
+      1. Spawn ``lxmd`` (own RNS instance, listens on a kernel-assigned
+         loopback port). The helper waits for the identity file +
+         listener readiness before returning.
+      2. Spawn sender and receiver bridges, ``lxmf_init`` each.
+      3. Each bridge attaches a TCP client interface dialed at lxmd's
+         port.
+      4. Sender + receiver announce their delivery destinations so
+         lxmd learns to route to them. lxmd announces its propagation
+         destination at startup (``announce_at_start = yes``); we
+         settle for 8s so the 3-node path table converges.
+      5. Sender + receiver call ``lxmf_set_outbound_propagation_node``
+         pinned at lxmd's destination hash + stamp cost.
     """
     import time
 
     sender_cmd = resolve_bridge_command(sender_impl)
     receiver_cmd = resolve_bridge_command(receiver_impl)
-    pn_cmd = resolve_bridge_command("python")
 
     sender_bridge = None
     receiver_bridge = None
-    pn_bridge = None
+    lxmd_pn = None
 
     try:
-        pn_bridge = BridgeClient(pn_cmd, env=_env_for_impl("python"))
+        lxmd_pn = LxmdPropagationNode()
+        listener_port = lxmd_pn.listen_port
+        pn_hash = bytes.fromhex(lxmd_pn.destination_hash)
+
         sender_bridge = BridgeClient(sender_cmd, env=_env_for_impl(sender_impl))
         receiver_bridge = BridgeClient(receiver_cmd, env=_env_for_impl(receiver_impl))
-
-        pn_init = pn_bridge.execute(
-            "lxmf_init",
-            display_name="conformance-pn",
-            enable_propagation_node=True,
-        )
-        if "propagation_destination_hash" not in pn_init:
-            raise RuntimeError(
-                "PN bridge did not return propagation_destination_hash; "
-                "either enable_propagation_node failed or the python "
-                "bridge is out of date."
-            )
 
         sender_init = sender_bridge.execute(
             "lxmf_init", display_name=f"sender-{sender_impl}"
@@ -380,12 +379,6 @@ def tcp_trio(sender_impl, receiver_impl):
         receiver_init = receiver_bridge.execute(
             "lxmf_init", display_name=f"receiver-{receiver_impl}"
         )
-
-        # PN binds first so the clients have a port to dial.
-        pn_iface = pn_bridge.execute(
-            "lxmf_add_tcp_server_interface", name="pnlistener"
-        )
-        listener_port = int(pn_iface["port"])
 
         sender_bridge.execute(
             "lxmf_add_tcp_client_interface",
@@ -401,35 +394,95 @@ def tcp_trio(sender_impl, receiver_impl):
         )
         time.sleep(1.5)
 
-        # Sender + receiver announce their delivery destinations so
-        # the PN learns about them. PN's `lxmf_announce` also fires
-        # `announce_propagation_node()` so the lxmf:propagation
-        # destination lands in sender + receiver path tables — without
-        # that, swift's outbound thread observes `hasPath=false` for
-        # the PN and the message never leaves `outbound`.
-        for _ in range(2):
-            pn_bridge.execute("lxmf_announce")
+        # Step 1: bridges path-request lxmd's propagation destination.
+        # lxmd announced once at startup via `announce_at_start = yes`,
+        # BEFORE the bridges' TCP clients connected — so the bridges
+        # missed that initial announce. The path-request solicits a
+        # fresh announce reply from lxmd. Empirically this MUST happen
+        # before the bridges issue their own delivery announces — when
+        # both flows interleave, the path-request reply gets lost in
+        # the announce flood and the bridges never learn lxmd's
+        # destination.
+        sender_bridge.execute(
+            "lxmf_request_path", destination_hash=pn_hash.hex()
+        )
+        receiver_bridge.execute(
+            "lxmf_request_path", destination_hash=pn_hash.hex()
+        )
+
+        deadline = time.time() + 15.0
+        sender_has_path = receiver_has_path = False
+        while time.time() < deadline:
+            if not sender_has_path:
+                r = sender_bridge.execute(
+                    "lxmf_has_path", destination_hash=pn_hash.hex()
+                )
+                sender_has_path = bool(r.get("has_path"))
+            if not receiver_has_path:
+                r = receiver_bridge.execute(
+                    "lxmf_has_path", destination_hash=pn_hash.hex()
+                )
+                receiver_has_path = bool(r.get("has_path"))
+            if sender_has_path and receiver_has_path:
+                break
             time.sleep(0.4)
+        if not (sender_has_path and receiver_has_path):
+            stderr = lxmd_pn.stderr_tail()[-2000:]
+            raise RuntimeError(
+                "tcp_trio: path to lxmd's propagation destination did not "
+                f"converge within 15s (sender={sender_has_path}, "
+                f"receiver={receiver_has_path}). lxmd stderr tail:\n{stderr}"
+            )
+
+        # Step 2: bridges announce their delivery destinations so the
+        # sender (via lxmd's transport-mode forwarding) learns the
+        # receiver's identity. Without this, sender's
+        # `RNS.Identity.recall(receiver_dest)` returns None and
+        # `lxmf_send_propagated` raises "No identity known".
+        for _ in range(2):
             sender_bridge.execute("lxmf_announce")
             time.sleep(0.4)
             receiver_bridge.execute("lxmf_announce")
             time.sleep(0.4)
 
-        pn_hash = bytes.fromhex(pn_init["propagation_destination_hash"])
-        # 3-bridge transport-mode topologies converge slower than the
-        # 2-bridge direct pair: announces have to traverse spawned
-        # peers, transport-mode forwarding has its own bandwidth caps,
-        # and stamp generation work on the sender side adds even more
-        # latency to the first propagation send. A fixed 8s settle is
-        # generous enough that running multiple `tcp_trio` fixtures in
-        # sequence stays deterministic.
-        time.sleep(8.0)
+        # Step 3: poll until each bridge knows the OTHER bridge's
+        # delivery destination. This is what `send_propagated` checks
+        # before encrypting.
+        sender_dest = bytes.fromhex(sender_init["delivery_destination_hash"])
+        receiver_dest = bytes.fromhex(receiver_init["delivery_destination_hash"])
+        deadline = time.time() + 15.0
+        s_knows_r = r_knows_s = False
+        while time.time() < deadline:
+            if not s_knows_r:
+                r = sender_bridge.execute(
+                    "lxmf_has_path", destination_hash=receiver_dest.hex()
+                )
+                s_knows_r = bool(r.get("has_path"))
+            if not r_knows_s:
+                r = receiver_bridge.execute(
+                    "lxmf_has_path", destination_hash=sender_dest.hex()
+                )
+                r_knows_s = bool(r.get("has_path"))
+            if s_knows_r and r_knows_s:
+                break
+            time.sleep(0.4)
+        if not (s_knows_r and r_knows_s):
+            stderr = lxmd_pn.stderr_tail()[-2000:]
+            raise RuntimeError(
+                "tcp_trio: bridge-to-bridge identity convergence failed "
+                f"within 15s (sender→receiver={s_knows_r}, "
+                f"receiver→sender={r_knows_s}). lxmd stderr tail:\n{stderr}"
+            )
 
-        # Pin the stamp cost the PN actually requires (PROPAGATION_COST
-        # in LXMF, with PROPAGATION_COST_MIN=13 floor). Without this the
-        # sender's outbound stamp generation falls back to "no work"
-        # (32 random bytes) and the PN rejects the upload as low-stamp.
-        pn_stamp_cost = int(pn_init.get("propagation_stamp_cost", 0))
+        # Stamp cost: lxmd uses LXMF.PROPAGATION_COST (default 16,
+        # floor PROPAGATION_COST_MIN = 13). The bridge's stamp
+        # generation needs to know this exactly — falling back to 0
+        # produces 32 random bytes that lxmd rejects.
+        # We're spinning up lxmd ourselves (with default
+        # PROPAGATION_COST), so we know the value statically. If a
+        # future test ever wants to override lxmd's stamp_cost, this
+        # value should be threaded through `LxmdPropagationNode`.
+        pn_stamp_cost = 16
         sender_bridge.execute(
             "lxmf_set_outbound_propagation_node",
             destination_hash=pn_hash.hex(),
@@ -447,13 +500,23 @@ def tcp_trio(sender_impl, receiver_impl):
             identity_hash=bytes.fromhex(sender_init["identity_hash"]),
             delivery_hash=bytes.fromhex(sender_init["delivery_destination_hash"]),
         )
+        # The "pn" position in the trio retains its _BridgeNode shape
+        # for backwards compatibility with tests that grab attributes
+        # off of it (e.g. `pn.bridge.execute("lxmf_announce")`). But
+        # since the PN is now an lxmd subprocess, the bridge field
+        # points at a tiny shim whose `execute` is a no-op for the
+        # commands tests historically called on the PN bridge — they
+        # only ever needed `lxmf_announce`, and lxmd already announces
+        # itself via the periodic interval. Tests that need the lxmd
+        # process directly can reach for `pn.lxmd_proc`.
         pn = _BridgeNode(
-            bridge=pn_bridge,
-            impl="python",
-            identity_hash=bytes.fromhex(pn_init["identity_hash"]),
-            delivery_hash=bytes.fromhex(pn_init["delivery_destination_hash"]),
+            bridge=_LxmdShim(lxmd_pn),
+            impl="lxmd",
+            identity_hash=b"",  # lxmd's identity hash isn't surfaced through this fixture
+            delivery_hash=b"",
         )
         pn.propagation_hash = pn_hash
+        pn.lxmd_proc = lxmd_pn
         receiver = _BridgeNode(
             bridge=receiver_bridge,
             impl=receiver_impl,
@@ -464,7 +527,7 @@ def tcp_trio(sender_impl, receiver_impl):
         yield sender, pn, receiver
 
     finally:
-        for bridge in (receiver_bridge, sender_bridge, pn_bridge):
+        for bridge in (receiver_bridge, sender_bridge):
             if bridge is None:
                 continue
             try:
@@ -475,6 +538,51 @@ def tcp_trio(sender_impl, receiver_impl):
                 bridge.close()
             except Exception:
                 pass
+        if lxmd_pn is not None:
+            try:
+                lxmd_pn.close()
+            except Exception:
+                pass
+
+
+class _LxmdShim:
+    """Minimal stand-in for a BridgeClient pointing at lxmd.
+
+    Tests historically called ``pn.bridge.execute("lxmf_announce")`` to
+    nudge the path table when a 3-bridge topology hadn't converged.
+    lxmd doesn't expose an external "announce now" hook, but it
+    announces at startup (``announce_at_start = yes``) and on its
+    periodic interval, so a synchronous re-announce isn't available.
+    The shim accepts the call as a no-op so existing tests don't
+    break; the periodic announce + the 8s settle in `tcp_trio` cover
+    convergence in practice.
+    """
+
+    def __init__(self, lxmd_pn):
+        self._lxmd_pn = lxmd_pn
+
+    def execute(self, command, **params):
+        if command == "lxmf_announce":
+            # lxmd handles this itself; nothing to do.
+            return {}
+        if command == "lxmf_shutdown":
+            # Teardown happens via LxmdPropagationNode.close() in the
+            # fixture's `finally`; redundant call from the test layer
+            # is a no-op.
+            return {"stopped": True}
+        raise RuntimeError(
+            f"_LxmdShim does not support command {command!r}; the "
+            "propagation-node role is now a real lxmd subprocess and "
+            "the small slice of bridge commands tests previously used "
+            "on it ({lxmf_announce, lxmf_shutdown}) are handled "
+            "transparently. If a test needs direct lxmd control, "
+            "reach for `pn.lxmd_proc` (an LxmdPropagationNode)."
+        )
+
+    def close(self):
+        # Lifecycle is owned by `LxmdPropagationNode.close()` which
+        # runs in the fixture's finally. Nothing to do here.
+        pass
 
 
 class _BridgeNode:

@@ -644,23 +644,54 @@ def cmd_lxmf_send_direct(params):
 
 
 def cmd_lxmf_has_path(params):
-    """Return whether RNS has a path entry for `destination_hash`.
+    """Return whether RNS has both a path entry AND a recallable identity for `destination_hash`.
 
-    Useful in 3-bridge fixtures so the test setup can poll for path
-    convergence before issuing a propagation send/sync — otherwise a
-    race between announce propagation and the test asking the router
-    to do work surfaces as `noPath` even though everything is wired
-    correctly.
+    LXMF's propagation flow checks ``RNS.Transport.has_path`` (path
+    table) before deciding to establish a link; the bridge's send
+    commands additionally need ``RNS.Identity.recall`` (so we can
+    encrypt). Both signals matter for fixture-side convergence
+    polling, so this command requires both — otherwise a transient
+    state where the path is registered but the identity hasn't yet
+    been resolved would make a polling fixture think convergence is
+    done before the next send is actually safe.
     """
     if _state.router is None:
         raise RuntimeError("lxmf_init must be called before lxmf_has_path")
     dest_hash = bytes.fromhex(params["destination_hash"])
-    # Mirrors what the bridge's send commands need: the destination's
-    # identity must be recallable (so we can encrypt to it). RNS may
-    # have a path-table entry without a recallable identity for
-    # transit destinations, but for the destinations we send to in
-    # tests, the announce delivers both.
-    return {"has_path": RNS.Identity.recall(dest_hash) is not None}
+    has_path = bool(RNS.Transport.has_path(dest_hash))
+    has_identity = RNS.Identity.recall(dest_hash) is not None
+    return {
+        "has_path": has_path and has_identity,
+        # Per-component visibility for diagnostics.
+        "transport_has_path": has_path,
+        "identity_recalled": has_identity,
+    }
+
+
+def cmd_lxmf_request_path(params):
+    """Solicit an announce for ``destination_hash`` via Reticulum's path-request flow.
+
+    Used in 3-bridge propagation fixtures: lxmd announces its
+    ``lxmf:propagation`` destination once on startup, but bridges
+    that connect *after* that initial announce don't observe it.
+    Without an active path-request from each bridge, the receiver
+    + sender path tables never learn about lxmd, and
+    ``lxmf_send_propagated`` parks at ``state='outbound'`` forever
+    waiting for a route that doesn't exist.
+
+    The call is fire-and-forget at the RNS layer; it doesn't block.
+    The caller should poll ``lxmf_has_path`` (or just sleep) after
+    issuing it. Returns a trivial ``{"requested": true}`` so callers
+    have something to assert on.
+
+    params:
+        destination_hash (hex): 16-byte destination hash to solicit.
+    """
+    if _state.router is None:
+        raise RuntimeError("lxmf_init must be called before lxmf_request_path")
+    dest_hash = bytes.fromhex(params["destination_hash"])
+    RNS.Transport.request_path(dest_hash)
+    return {"requested": True}
 
 
 def cmd_lxmf_set_outbound_propagation_node(params):
@@ -991,6 +1022,7 @@ COMMANDS = {
     "lxmf_send_opportunistic": cmd_lxmf_send_opportunistic,
     "lxmf_send_direct": cmd_lxmf_send_direct,
     "lxmf_has_path": cmd_lxmf_has_path,
+    "lxmf_request_path": cmd_lxmf_request_path,
     "lxmf_set_outbound_propagation_node": cmd_lxmf_set_outbound_propagation_node,
     "lxmf_send_propagated": cmd_lxmf_send_propagated,
     "lxmf_sync_inbound": cmd_lxmf_sync_inbound,
