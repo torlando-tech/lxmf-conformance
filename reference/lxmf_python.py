@@ -457,6 +457,81 @@ def cmd_lxmf_send_opportunistic(params):
     return {"message_hash": msg_hash.hex()}
 
 
+def cmd_lxmf_send_direct(params):
+    """Send a DIRECT (link-based) LXMF message.
+
+    Like opportunistic, but the message is sent over a Reticulum Link
+    rather than as a single encrypted packet. The recipient must be
+    reachable (announce observed) so we can establish the outbound
+    link. LXMRouter handles link establishment internally — we just
+    set ``desired_method=DIRECT`` and let the outbound thread do its
+    thing.
+
+    Direct messages can carry payloads larger than
+    ``ENCRYPTED_PACKET_MAX_CONTENT`` because the link transport
+    fragments via Resource transfer when the packed message exceeds
+    ``LINK_PACKET_MAX_CONTENT``.
+
+    params:
+        destination_hash (hex): the recipient's LXMF delivery destination
+            hash (16 bytes).
+        content (str): UTF-8 message content.
+        title (str, optional): UTF-8 title; defaults to "".
+
+    Returns:
+        message_hash (hex): the LXMessage hash; tests track this via
+            cmd_lxmf_get_message_state for delivery confirmation.
+    """
+    if _state.router is None:
+        raise RuntimeError("lxmf_init must be called before lxmf_send_direct")
+
+    dest_hash_hex = params["destination_hash"]
+    content = params["content"]
+    title = params.get("title", "")
+
+    dest_hash = bytes.fromhex(dest_hash_hex)
+
+    recipient_identity = RNS.Identity.recall(dest_hash)
+    if recipient_identity is None:
+        raise RuntimeError(
+            f"No identity known for destination {dest_hash_hex}. The "
+            f"recipient must announce its delivery destination before "
+            f"this peer can send to it."
+        )
+
+    recipient_destination = RNS.Destination(
+        recipient_identity,
+        RNS.Destination.OUT,
+        RNS.Destination.SINGLE,
+        "lxmf",
+        "delivery",
+    )
+
+    def state_callback(msg):
+        if msg.hash:
+            with _state._outbound_lock:
+                _state._outbound_state[msg.hash] = _state_to_string(msg.state)
+
+    message = LXMF.LXMessage(
+        destination=recipient_destination,
+        source=_state.delivery_destination,
+        content=content,
+        title=title,
+        desired_method=LXMF.LXMessage.DIRECT,
+    )
+    message.register_delivery_callback(state_callback)
+    message.register_failed_callback(state_callback)
+
+    _state.router.handle_outbound(message)
+
+    msg_hash = message.hash if message.hash else b""
+    if msg_hash:
+        with _state._outbound_lock:
+            _state._outbound_state[msg_hash] = _state_to_string(message.state)
+
+    return {"message_hash": msg_hash.hex()}
+
+
 def cmd_lxmf_get_received_messages(params):
     """Drain (or peek) inbound messages.
 
@@ -648,6 +723,7 @@ COMMANDS = {
     "lxmf_add_tcp_client_interface": cmd_lxmf_add_tcp_client_interface,
     "lxmf_announce": cmd_lxmf_announce,
     "lxmf_send_opportunistic": cmd_lxmf_send_opportunistic,
+    "lxmf_send_direct": cmd_lxmf_send_direct,
     "lxmf_get_received_messages": cmd_lxmf_get_received_messages,
     "lxmf_get_message_state": cmd_lxmf_get_message_state,
     "lxmf_shutdown": cmd_lxmf_shutdown,

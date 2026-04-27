@@ -12,15 +12,24 @@
   - `tests/test_opportunistic.py` — A sends opportunistic to B; B receives correct payload; A's outbound state reaches `delivered`.
 - CI workflow that builds the Swift bridge, runs the cross-impl tests against `(python, python)` and `(python, swift)` and `(swift, python)` and `(swift, swift)`.
 
-## Phase 1.1 — Swift outbound fix
+## Phase 1.1 — Swift outbound fix (shipped)
 
-The Phase 1 test matrix shows the Swift bridge's inbound path working (`python → swift` passes both announce and opportunistic), but the outbound path fails when Swift hosts the TCPServer (`swift → python` and `swift → swift`). Likely culprits to investigate:
+Root cause: the swift bridge created `TCPServerInterface` but never set
+`onClientConnected`, so accepted connections produced
+`TCPSpawnedPeerInterface` children that never entered
+`Transport.interfaces`. Inbound packets on those children (announce,
+proof, link request) reached `receive(packet:from:)` with an unknown
+interfaceId and were dropped before path-table updates ran. The
+visible failure was "No identity known for destination …" because
+swift's path table never observed the python client's announce.
 
-- `Announce(destination:).buildPacket()` then `transport.send(packet:)` — does the announce traverse the spawned `TCPSpawnedPeerInterface` correctly when a python TCPClient is connected?
-- Path-table convergence — does the swift router observe the python client's announce in time? Compare against `reticulum-swift`'s own wire-layer tests for the same pair direction.
-- `LXMRouter.handleOutbound` for `.opportunistic` — does the path-table lookup succeed when the path was learned from a spawned peer interface rather than a directly-attached `TCPInterface`?
+Fix: wire `onClientConnected` to register every spawned peer with the
+transport, mirroring the existing reticulum-swift bridge
+(`ConformanceBridge/WireTcp.swift:319-343`). All 8 Phase 1 trios now
+pass — `python→python`, `python→swift`, `swift→python`, `swift→swift`
+across both `test_announce_discovery` and `test_opportunistic`.
 
-Once that's resolved, all 8 Phase 1 trios should pass and we can move on to Phase 2.
+Landed in [LXMF-swift PR #5](https://github.com/torlando-tech/LXMF-swift/pull/5).
 
 ## Phase 2 (deferred)
 

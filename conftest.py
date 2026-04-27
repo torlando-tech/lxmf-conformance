@@ -325,6 +325,16 @@ class _BridgeNode:
         )
         return bytes.fromhex(result["message_hash"])
 
+    def send_direct(self, recipient_hash, content, title=""):
+        """Send DIRECT (link-based) LXMF; returns the message hash."""
+        result = self.bridge.execute(
+            "lxmf_send_direct",
+            destination_hash=recipient_hash.hex(),
+            content=content,
+            title=title,
+        )
+        return bytes.fromhex(result["message_hash"])
+
     def drain_received(self):
         """Return all received messages since last drain."""
         result = self.bridge.execute(
