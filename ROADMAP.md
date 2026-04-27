@@ -31,49 +31,51 @@ across both `test_announce_discovery` and `test_opportunistic`.
 
 Landed in [LXMF-swift PR #5](https://github.com/torlando-tech/LXMF-swift/pull/5).
 
-## Phase 2 (deferred)
+## Phase 2 (mostly shipped)
 
-These are the test categories that need to land before this suite covers the LXMF protocol meaningfully. Listed in roughly the order they should be tackled — earlier items are prerequisites for later ones.
+Most of the meaningful Phase 2 cross-impl coverage is in place. The
+suite ships 28 passing trios across 7 test files (4 trios each):
 
-### Real PipeInterface-backed pair fixture
+- `test_announce_discovery.py` — pipe-connected pair, both nodes
+  announce, both observe each other's path entry.
+- `test_opportunistic.py` — single-packet opportunistic; receiver
+  surfaces correct payload and sender's outbound state reaches
+  `delivered`.
+- `test_direct.py` — small DIRECT (link-based); explicit-format
+  proof signed with the link's signing key flows back from receiver
+  so the sender's `PacketReceipt` callback fires.
+- `test_direct_large.py` — multi-KB DIRECT message; exercises
+  Resource transfer fragmentation + reassembly across the link.
+- `test_attachments.py` — `FIELD_FILE_ATTACHMENTS` roundtrip;
+  bridge wire format uses tagged objects (`{"bytes": "<hex>"}`,
+  `{"str": "..."}`) to express LXMF's `[UInt8: Any]` field map.
+- `test_combined.py` — multi-KB content + attachment over
+  Resource transfer simultaneously.
+- `test_propagation.py` — sender → python_pn → receiver. PN is
+  always python because swift LXMF doesn't implement
+  `enable_propagation()` (in-process propagation daemon is
+  python-only).
+
+### Real PipeInterface-backed pair fixture (deferred)
 - Phase 1 ships TCP loopback as the direct-pair transport. The original design called for a Reticulum `PipeInterface` (or fd-pair equivalent) so the test pair has *zero* networking layer between them.
 - The Python `RNS.Interfaces.PipeInterface` doesn't fit cleanly because it spawns a subprocess via `command =` config; we'd need to subclass it for fd-pair use. macOS's `posix_spawn` + `pass_fds` interaction also surfaced subtle EOF issues during initial Phase 1 work that took longer to debug than the actual cross-impl tests warranted.
-- Phase 2 task: write an `FdPipeInterface` for both Python and Swift bridges (HDLC framing matching the upstream `PipeInterface.HDLC`), wire them via `os.pipe()` pairs and `subprocess.pass_fds`, debug the EOF behaviour, and switch the test fixture back. Test surface stays unchanged — only the bridge command surface and the conftest fixture shift.
+- Refinement task: write an `FdPipeInterface` for both Python and Swift bridges (HDLC framing matching the upstream `PipeInterface.HDLC`), wire them via `os.pipe()` pairs and `subprocess.pass_fds`, debug the EOF behaviour, and switch the test fixture back. Test surface stays unchanged — only the bridge command surface and the conftest fixture shift.
 
-### Direct (link-based) delivery
-- New bridge command: `lxmf_send_direct { destination_hash, content, title? }`.
-- New test: `tests/test_direct.py::test_direct_message_with_link_proof`.
-- Same pipe-pair topology; receiver must surface the message with `method == "direct"`.
+### Sync with propagation node (extensions)
+- Current `test_propagation.py` covers the basic happy path. Follow-ups:
+  - Partial sync (PN has > 1 message; receiver pulls them all).
+  - Retransmission (link drop mid-sync; receiver re-syncs).
+  - Stamp generation interop edge cases.
 
-### Propagation
-- Three-bridge topology: sender → propagation node → receiver.
-- Propagation node: a real `lxmd` subprocess attached via shared instance (mirrors `reticulum-conformance/reference/lxmf_bridge.py::cmd_lxmf_spawn_daemon_propagation_node`).
-- New bridge commands: `lxmf_set_outbound_propagation_node`, `lxmf_send_propagated`, `lxmf_sync_inbound`.
-- Tests:
-  - Sender submits to PN; PN stores message; receiver pulls via sync and decodes.
-  - Stamp generation interop (Python sender ↔ Swift receiver must agree on stamp validation).
-  - 3-node topology requires more than two bridges per test — extend `pipe_pair` into `pipe_trio` / `tcp_trio` fixtures.
-
-### Sync with propagation node
-- Receiver-side: `lxmf_sync_inbound` blocks until the propagation transfer completes.
-- Tests for partial sync, retransmission, and link drop during sync.
-
-### Attachments
-- New tests for `FIELD_FILE_ATTACHMENTS` (key 5), `FIELD_IMAGE` (key 6), `FIELD_AUDIO` (key 7).
-- Field encoding crosses the largest cross-impl divergence risk: Python's `[filename, bytes]` pairs vs. Swift's tagged-dict shape. Mirror the `_decode_field_value_from_params` / `_encode_field_value_for_inbox` pattern from reticulum-conformance.
-
-### Large messages
-- Direct + propagation paths support multi-packet messages via Resource transfer.
-- Tests for messages exceeding `LINK_PACKET_MAX_CONTENT` (~316 bytes for direct, propagation buckets are larger).
-- Resource transfer interop is a high-risk surface — bytes must reassemble identically across impls.
-
-### Combined attachment + text + large
-- `text + image + file` matrix per delivery method.
-
-### Kotlin bridge implementation
-- Land the seven Phase 1 commands against reticulum-kt's LXMF library.
+### Kotlin bridge implementation (not started)
+- Land the Phase 1 + Phase 2 command surface against reticulum-kt / a Kotlin LXMF library.
 - Once present, add `kotlin` to `BRIDGE_COMMANDS` parametrization (it's already wired; just needs the binary).
 - Cross-language permutations including kotlin pairs activate automatically.
+
+### Real lxmd-subprocess propagation node (refinement)
+- Current PN role uses python LXMF's `enable_propagation()` in-process daemon.
+- Production deployments run `lxmd` as a separate subprocess attached via shared RNS instance — mirrors `reticulum-conformance/reference/lxmf_bridge.py::cmd_lxmf_spawn_daemon_propagation_node`.
+- Refinement task: add `share_instance=Yes` mode to the python bridge's RNS startup, plus `lxmf_spawn_daemon_propagation_node`, so the PN trio runs against an actual `lxmd` rather than an in-process router.
 
 ## Test scope expansion
 
