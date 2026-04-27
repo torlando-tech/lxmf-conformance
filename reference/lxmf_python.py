@@ -102,6 +102,77 @@ _state = _BridgeState()
 
 
 # --------------------------------------------------------------------------- #
+# LXMF field encoding / decoding
+# --------------------------------------------------------------------------- #
+#
+# LXMF `fields` is a `dict[int, Any]` where leaf values can be bytes,
+# strings, ints, bools, or nested lists/dicts. JSON-RPC can't express
+# bytes directly, so the bridge wire format uses tagged objects:
+#   - {"bytes": "<hex>"}
+#   - {"str": "..."}
+#   - {"int": 123}
+#   - {"bool": true}
+#   - JSON arrays for lists (recursive)
+#   - bare JSON primitives pass through
+#
+# The explicit "bytes" tag is load-bearing for FIELD_FILE_ATTACHMENTS:
+# attachment elements are `[filename_str, data_bytes]` and without a
+# tag there's no way to distinguish hex-encoded bytes from a literal
+# string. Mirrors reticulum-conformance's `lxmf_bridge.py` so the two
+# suites encode attachments identically.
+
+
+def _encode_field_value_for_inbox(value):
+    """Recursively convert bytes -> hex so the value is JSON-safe."""
+    if isinstance(value, bytes):
+        return value.hex()
+    if isinstance(value, (list, tuple)):
+        return [_encode_field_value_for_inbox(v) for v in value]
+    if isinstance(value, dict):
+        return {str(k): _encode_field_value_for_inbox(v) for k, v in value.items()}
+    return value
+
+
+def _decode_field_value_from_params(value):
+    """Inverse of `_encode_field_value_for_inbox` for the send side."""
+    if isinstance(value, dict):
+        if "bytes" in value:
+            return bytes.fromhex(value["bytes"])
+        if "str" in value:
+            return value["str"]
+        if "int" in value:
+            return int(value["int"])
+        if "bool" in value:
+            return bool(value["bool"])
+        raise ValueError(
+            f"Unsupported LXMF field object shape; expected one of "
+            f"{{bytes|str|int|bool}}: {value!r}"
+        )
+    if isinstance(value, list):
+        return [_decode_field_value_from_params(v) for v in value]
+    return value
+
+
+def _decode_fields_param(fields_param):
+    """Convert the JSON `fields` dict (str keys -> tagged values) into
+    the `dict[int, Any]` shape LXMessage expects."""
+    if not fields_param:
+        return {}
+    decoded = {}
+    for k, v in fields_param.items():
+        decoded[int(k)] = _decode_field_value_from_params(v)
+    return decoded
+
+
+def _encode_message_fields(message):
+    """Pull `message.fields` off an inbound LXMessage and JSON-ify."""
+    fields = {}
+    for k, v in (getattr(message, "fields", None) or {}).items():
+        fields[str(k)] = _encode_field_value_for_inbox(v)
+    return fields
+
+
+# --------------------------------------------------------------------------- #
 # LXMF bridge commands
 # --------------------------------------------------------------------------- #
 
@@ -220,6 +291,7 @@ def cmd_lxmf_init(params):
                 "method": method_name,
                 "ack_status": ack_status,
                 "received_at_ms": int(time.time() * 1000),
+                "fields": _encode_message_fields(message),
             }
             _state._inbox.append(entry)
 
@@ -394,6 +466,7 @@ def cmd_lxmf_send_opportunistic(params):
     dest_hash_hex = params["destination_hash"]
     content = params["content"]
     title = params.get("title", "")
+    fields = _decode_fields_param(params.get("fields"))
 
     dest_hash = bytes.fromhex(dest_hash_hex)
 
@@ -429,6 +502,7 @@ def cmd_lxmf_send_opportunistic(params):
         source=_state.delivery_destination,
         content=content,
         title=title,
+        fields=fields,
         desired_method=LXMF.LXMessage.OPPORTUNISTIC,
     )
     message.register_delivery_callback(state_callback)
@@ -488,6 +562,7 @@ def cmd_lxmf_send_direct(params):
     dest_hash_hex = params["destination_hash"]
     content = params["content"]
     title = params.get("title", "")
+    fields = _decode_fields_param(params.get("fields"))
 
     dest_hash = bytes.fromhex(dest_hash_hex)
 
@@ -517,6 +592,7 @@ def cmd_lxmf_send_direct(params):
         source=_state.delivery_destination,
         content=content,
         title=title,
+        fields=fields,
         desired_method=LXMF.LXMessage.DIRECT,
     )
     message.register_delivery_callback(state_callback)

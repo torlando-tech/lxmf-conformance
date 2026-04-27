@@ -315,24 +315,33 @@ class _BridgeNode:
         """Emit an LXMF delivery announce."""
         self.bridge.execute("lxmf_announce")
 
-    def send_opportunistic(self, recipient_hash, content, title=""):
-        """Send opportunistic LXMF; returns the message hash."""
-        result = self.bridge.execute(
-            "lxmf_send_opportunistic",
-            destination_hash=recipient_hash.hex(),
-            content=content,
-            title=title,
-        )
+    def send_opportunistic(self, recipient_hash, content, title="", fields=None):
+        """Send opportunistic LXMF; returns the message hash.
+
+        ``fields`` is the bridge wire-format `fields` dict — keys are
+        field id strings, values are tagged objects (see
+        `lxmf_python.py::_decode_field_value_from_params`).
+        """
+        params = {
+            "destination_hash": recipient_hash.hex(),
+            "content": content,
+            "title": title,
+        }
+        if fields is not None:
+            params["fields"] = fields
+        result = self.bridge.execute("lxmf_send_opportunistic", **params)
         return bytes.fromhex(result["message_hash"])
 
-    def send_direct(self, recipient_hash, content, title=""):
+    def send_direct(self, recipient_hash, content, title="", fields=None):
         """Send DIRECT (link-based) LXMF; returns the message hash."""
-        result = self.bridge.execute(
-            "lxmf_send_direct",
-            destination_hash=recipient_hash.hex(),
-            content=content,
-            title=title,
-        )
+        params = {
+            "destination_hash": recipient_hash.hex(),
+            "content": content,
+            "title": title,
+        }
+        if fields is not None:
+            params["fields"] = fields
+        result = self.bridge.execute("lxmf_send_direct", **params)
         return bytes.fromhex(result["message_hash"])
 
     def drain_received(self):
