@@ -66,16 +66,48 @@ import LXMF  # noqa: E402
 # multiprocessing.Process workers (job_linux). In a bridge subprocess
 # launched by pytest those workers hang indefinitely — they inherit FDs
 # and signal masks that confuse the manager, and the bridge never sees
-# the stamp result. job_simple() is the upstream-blessed single-process
-# fallback (LXStamper.py:145, "should work on any platform, used as a
-# fall-back, in case of limited multi-processing"). Cost-12 stamps take
-# < 1s here, well under any test timeout, so we don't need parallelism.
+# the stamp result. We force the single-process path (LXStamper.py:145
+# "should work on any platform, used as a fall-back, in case of limited
+# multi-processing"). Cost-12 stamps take < 1s, well under any test
+# timeout, so we don't need parallelism.
+#
+# Two implementations of the override depending on which LXMF is loaded:
+#
+#   1. PREFERRED — call LXStamper.set_external_generator(callback) if it
+#      exists. This is the upstream-blessed registration hook (PR
+#      markqvist/LXMF#38, on torlando-tech/LXMF feature branch as of
+#      2025-12). Same hook Columba uses on Android via Chaquopy.
+#
+#   2. FALLBACK — monkey-patch LXStamper.generate_stamp directly. Works
+#      against an unmodified upstream LXMF that hasn't merged #38 yet.
+#
+# Either way the bridge ends up running cost-12 stamps single-process
+# in <1s and propagation tests are unblocked.
 # --------------------------------------------------------------------------- #
 import LXMF.LXStamper as _LXStamper  # noqa: E402
 
 
+def _external_stamp_generator(workblock, stamp_cost):
+    """Single-process stamp generator matching LXMF#38's callback shape:
+    (workblock: bytes, stamp_cost: int) -> (stamp: bytes, rounds: int).
+    """
+    start_time = time.time()
+    # job_simple wants a message_id key for active_jobs bookkeeping; we
+    # don't have one here so synthesize a stable per-call id.
+    pseudo_msg_id = RNS.Identity.full_hash(workblock + stamp_cost.to_bytes(4, "big"))
+    stamp, rounds = _LXStamper.job_simple(stamp_cost, workblock, pseudo_msg_id)
+    duration = time.time() - start_time
+    RNS.log(
+        f"[bridge] Single-process stamp generated in "
+        f"{RNS.prettytime(duration)}, {rounds} rounds",
+        RNS.LOG_DEBUG,
+    )
+    return stamp, rounds
+
+
 def _generate_stamp_single_process(message_id, stamp_cost,
                                    expand_rounds=_LXStamper.WORKBLOCK_EXPAND_ROUNDS):
+    """Monkey-patch fallback for LXMF without set_external_generator."""
     workblock = _LXStamper.stamp_workblock(message_id, expand_rounds=expand_rounds)
     start_time = time.time()
     stamp, rounds = _LXStamper.job_simple(stamp_cost, workblock, message_id)
@@ -89,7 +121,10 @@ def _generate_stamp_single_process(message_id, stamp_cost,
     return stamp, value
 
 
-_LXStamper.generate_stamp = _generate_stamp_single_process
+if hasattr(_LXStamper, "set_external_generator"):
+    _LXStamper.set_external_generator(_external_stamp_generator)
+else:
+    _LXStamper.generate_stamp = _generate_stamp_single_process
 
 # --------------------------------------------------------------------------- #
 # Bridge state
