@@ -131,8 +131,6 @@ class BridgeClient:
         """
         try:
             for line in iter(self._proc.stderr.readline, ""):
-                if not line:
-                    break
                 self._stderr_tail.append(line)
         except Exception:
             pass
@@ -198,6 +196,13 @@ class BridgeClient:
             except subprocess.TimeoutExpired:
                 self._proc.kill()
                 self._proc.wait()
+        # Drain any final stderr lines into _stderr_tail before callers
+        # (typically test teardown catching a BridgeError) inspect the
+        # snapshot. The thread exits naturally as soon as stderr hits
+        # EOF post-wait; bound the join so a misbehaving bridge can't
+        # wedge teardown.
+        if hasattr(self, "_stderr_thread"):
+            self._stderr_thread.join(timeout=2)
 
     def __enter__(self):
         return self
