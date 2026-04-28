@@ -15,11 +15,13 @@ on:
 
 jobs:
   conformance:
-    # macOS: Swift 5.9+ is preinstalled on macos-14 runners and the
-    # swift bridge build uses CryptoKit which requires Apple platforms.
-    # macOS-14 also runs the python side comfortably (markqvist/LXMF
-    # has no Linux-only deps).
-    runs-on: macos-14
+    # macOS: macos-15 ships Xcode 16 / Swift 6, which the swift bridge
+    # (and the reticulum-swift checkout it depends on) requires —
+    # actor-isolation conformances and `@preconcurrency` placement we
+    # use don't compile under Swift 5.9. The swift bridge also uses
+    # CryptoKit, which is Apple-only. The python side runs fine here
+    # too (markqvist/LXMF has no Linux-only deps).
+    runs-on: macos-15
     timeout-minutes: 25
 
     steps:
