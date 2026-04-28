@@ -60,6 +60,73 @@ import RNS  # noqa: E402  -- after path setup
 import LXMF  # noqa: E402
 
 # --------------------------------------------------------------------------- #
+# Stamp generation: force single-process path.
+#
+# LXStamper.generate_stamp() dispatches by platform and on Linux uses
+# multiprocessing.Process workers (job_linux). In a bridge subprocess
+# launched by pytest those workers hang indefinitely — they inherit FDs
+# and signal masks that confuse the manager, and the bridge never sees
+# the stamp result. We force the single-process path (LXStamper.py:145
+# "should work on any platform, used as a fall-back, in case of limited
+# multi-processing"). Cost-12 stamps take < 1s, well under any test
+# timeout, so we don't need parallelism.
+#
+# Two implementations of the override depending on which LXMF is loaded:
+#
+#   1. PREFERRED — call LXStamper.set_external_generator(callback) if it
+#      exists. This is the upstream-blessed registration hook (PR
+#      markqvist/LXMF#38, on torlando-tech/LXMF feature branch as of
+#      2025-12). Same hook Columba uses on Android via Chaquopy.
+#
+#   2. FALLBACK — monkey-patch LXStamper.generate_stamp directly. Works
+#      against an unmodified upstream LXMF that hasn't merged #38 yet.
+#
+# Either way the bridge ends up running cost-12 stamps single-process
+# in <1s and propagation tests are unblocked.
+# --------------------------------------------------------------------------- #
+import LXMF.LXStamper as _LXStamper  # noqa: E402
+
+
+def _external_stamp_generator(workblock, stamp_cost):
+    """Single-process stamp generator matching LXMF#38's callback shape:
+    (workblock: bytes, stamp_cost: int) -> (stamp: bytes, rounds: int).
+    """
+    start_time = time.time()
+    # job_simple wants a message_id key for active_jobs bookkeeping; we
+    # don't have one here so synthesize a stable per-call id.
+    pseudo_msg_id = RNS.Identity.full_hash(workblock + stamp_cost.to_bytes(4, "big"))
+    stamp, rounds = _LXStamper.job_simple(stamp_cost, workblock, pseudo_msg_id)
+    duration = time.time() - start_time
+    RNS.log(
+        f"[bridge] Single-process stamp generated in "
+        f"{RNS.prettytime(duration)}, {rounds} rounds",
+        RNS.LOG_DEBUG,
+    )
+    return stamp, rounds
+
+
+def _generate_stamp_single_process(message_id, stamp_cost,
+                                   expand_rounds=_LXStamper.WORKBLOCK_EXPAND_ROUNDS):
+    """Monkey-patch fallback for LXMF without set_external_generator."""
+    workblock = _LXStamper.stamp_workblock(message_id, expand_rounds=expand_rounds)
+    start_time = time.time()
+    stamp, rounds = _LXStamper.job_simple(stamp_cost, workblock, message_id)
+    duration = time.time() - start_time
+    value = _LXStamper.stamp_value(workblock, stamp) if stamp is not None else 0
+    RNS.log(
+        f"[bridge] Single-process stamp value={value} in "
+        f"{RNS.prettytime(duration)}, {rounds} rounds",
+        RNS.LOG_DEBUG,
+    )
+    return stamp, value
+
+
+if hasattr(_LXStamper, "set_external_generator"):
+    _LXStamper.set_external_generator(_external_stamp_generator)
+else:
+    _LXStamper.generate_stamp = _generate_stamp_single_process
+
+# --------------------------------------------------------------------------- #
 # Bridge state
 # --------------------------------------------------------------------------- #
 
@@ -339,6 +406,54 @@ def cmd_lxmf_init(params):
     return result
 
 
+def _apply_default_interface_attrs(iface):
+    """Mirror the attrs that `RNS.Reticulum.interface_post_init` normally sets.
+
+    The bridge constructs interfaces directly via the TCP{Client,Server}Interface
+    constructors instead of going through Reticulum's config-file parser, which
+    means the standard `interface_post_init` defaults never get applied. RNS
+    Transport later assumes those attrs exist (`announce_rate_target`,
+    `announce_cap`, `mode`, `ifac_size`, etc.) — a missing attr fires
+    `AttributeError` deep inside Transport's announce/forward path. The
+    visible failure mode is a TCPInterface that keeps reconnecting (the
+    AttributeError gets caught by Transport's interface error handler) and
+    LXMF outbound messages parking at `state='outbound'` because their
+    underlying link establishment can't traverse the broken interface.
+
+    This function applies the same defaults `interface_post_init` does for
+    a plain `[interfaces] [[Name]]` block with no extra options.
+    """
+    from RNS.Interfaces.Interface import Interface
+
+    iface.mode = Interface.MODE_FULL
+    iface.announce_cap = RNS.Reticulum.ANNOUNCE_CAP / 100.0
+    iface.bootstrap_only = False
+    iface.optimise_mtu()
+    iface.ifac_size = iface.DEFAULT_IFAC_SIZE
+    iface.discoverable = False
+    iface.discovery_announce_interval = None
+    iface.discovery_publish_ifac = False
+    iface.reachable_on = None
+    iface.discovery_name = None
+    iface.discovery_encrypt = False
+    iface.discovery_stamp_value = None
+    iface.discovery_latitude = None
+    iface.discovery_longitude = None
+    iface.discovery_height = None
+    iface.discovery_frequency = None
+    iface.discovery_bandwidth = None
+    iface.discovery_modulation = None
+    iface.announce_rate_target = None
+    iface.announce_rate_grace = None
+    iface.announce_rate_penalty = None
+    iface.ingress_control = True
+    iface.ifac_netname = None
+    iface.ifac_netkey = None
+    iface.ifac_signature = None
+    iface.ifac_key = None
+    iface.ifac_identity = None
+
+
 def cmd_lxmf_add_tcp_server_interface(params):
     """Attach a TCPServerInterface listening on loopback.
 
@@ -382,6 +497,7 @@ def cmd_lxmf_add_tcp_server_interface(params):
     }
     iface = TCPServerInterface(RNS.Transport, iface_config)
     iface.OUT = True
+    _apply_default_interface_attrs(iface)
     _state.reticulum._add_interface(iface)
     _state._interfaces.append(iface)
 
@@ -420,6 +536,7 @@ def cmd_lxmf_add_tcp_client_interface(params):
     }
     iface = TCPClientInterface(RNS.Transport, iface_config)
     iface.OUT = True
+    _apply_default_interface_attrs(iface)
     _state.reticulum._add_interface(iface)
     _state._interfaces.append(iface)
 
@@ -644,23 +761,54 @@ def cmd_lxmf_send_direct(params):
 
 
 def cmd_lxmf_has_path(params):
-    """Return whether RNS has a path entry for `destination_hash`.
+    """Return whether RNS has both a path entry AND a recallable identity for `destination_hash`.
 
-    Useful in 3-bridge fixtures so the test setup can poll for path
-    convergence before issuing a propagation send/sync — otherwise a
-    race between announce propagation and the test asking the router
-    to do work surfaces as `noPath` even though everything is wired
-    correctly.
+    LXMF's propagation flow checks ``RNS.Transport.has_path`` (path
+    table) before deciding to establish a link; the bridge's send
+    commands additionally need ``RNS.Identity.recall`` (so we can
+    encrypt). Both signals matter for fixture-side convergence
+    polling, so this command requires both — otherwise a transient
+    state where the path is registered but the identity hasn't yet
+    been resolved would make a polling fixture think convergence is
+    done before the next send is actually safe.
     """
     if _state.router is None:
         raise RuntimeError("lxmf_init must be called before lxmf_has_path")
     dest_hash = bytes.fromhex(params["destination_hash"])
-    # Mirrors what the bridge's send commands need: the destination's
-    # identity must be recallable (so we can encrypt to it). RNS may
-    # have a path-table entry without a recallable identity for
-    # transit destinations, but for the destinations we send to in
-    # tests, the announce delivers both.
-    return {"has_path": RNS.Identity.recall(dest_hash) is not None}
+    has_path = bool(RNS.Transport.has_path(dest_hash))
+    has_identity = RNS.Identity.recall(dest_hash) is not None
+    return {
+        "has_path": has_path and has_identity,
+        # Per-component visibility for diagnostics.
+        "transport_has_path": has_path,
+        "identity_recalled": has_identity,
+    }
+
+
+def cmd_lxmf_request_path(params):
+    """Solicit an announce for ``destination_hash`` via Reticulum's path-request flow.
+
+    Used in 3-bridge propagation fixtures: lxmd announces its
+    ``lxmf:propagation`` destination once on startup, but bridges
+    that connect *after* that initial announce don't observe it.
+    Without an active path-request from each bridge, the receiver
+    + sender path tables never learn about lxmd, and
+    ``lxmf_send_propagated`` parks at ``state='outbound'`` forever
+    waiting for a route that doesn't exist.
+
+    The call is fire-and-forget at the RNS layer; it doesn't block.
+    The caller should poll ``lxmf_has_path`` (or just sleep) after
+    issuing it. Returns a trivial ``{"requested": true}`` so callers
+    have something to assert on.
+
+    params:
+        destination_hash (hex): 16-byte destination hash to solicit.
+    """
+    if _state.router is None:
+        raise RuntimeError("lxmf_init must be called before lxmf_request_path")
+    dest_hash = bytes.fromhex(params["destination_hash"])
+    RNS.Transport.request_path(dest_hash)
+    return {"requested": True}
 
 
 def cmd_lxmf_set_outbound_propagation_node(params):
@@ -991,6 +1139,7 @@ COMMANDS = {
     "lxmf_send_opportunistic": cmd_lxmf_send_opportunistic,
     "lxmf_send_direct": cmd_lxmf_send_direct,
     "lxmf_has_path": cmd_lxmf_has_path,
+    "lxmf_request_path": cmd_lxmf_request_path,
     "lxmf_set_outbound_propagation_node": cmd_lxmf_set_outbound_propagation_node,
     "lxmf_send_propagated": cmd_lxmf_send_propagated,
     "lxmf_sync_inbound": cmd_lxmf_sync_inbound,
@@ -1036,12 +1185,21 @@ def _main():
     is the convention).
     """
     print("READY", flush=True)
+    # After READY, route any further stdout writes to stderr. RNS.log
+    # writes to sys.stdout by default and would otherwise leak onto the
+    # JSON-RPC response channel, where the test harness silently drops
+    # them as non-JSON. Reroute so that diagnostics from the underlying
+    # RNS / LXMF stack are visible to anyone running the conformance suite.
+    # The JSON-RPC writes below use a captured stdout reference so they
+    # still go to the real stdout.
+    _stdout_for_rpc = sys.stdout
+    sys.stdout = sys.stderr
     for line in sys.stdin:
         line = line.strip()
         if not line:
             continue
         response = _handle_request(line)
-        print(json.dumps(response), flush=True)
+        print(json.dumps(response), flush=True, file=_stdout_for_rpc)
 
 
 if __name__ == "__main__":

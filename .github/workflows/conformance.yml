@@ -1,11 +1,16 @@
 name: LXMF Conformance Tests
 
-# Cross-impl conformance check. Runs the LXMF protocol test suite
-# against every (server_impl, client_impl) pair so a regression in
-# any single bridge surfaces against every peer.
+# Self-test for the lxmf-conformance harness itself. Runs the protocol
+# suite with --impls python so only the reference (python ↔ python)
+# trios execute. This validates that the harness, fixtures, and reference
+# bridge all keep working without depending on any external bridge being
+# checked out and feature-complete.
 #
-# Phase 1 matrix: python and swift on both sides (4 combos per test).
-# Phase 2 will add kotlin once the kotlin bridge implementation lands.
+# Cross-impl runs (swift, kotlin) live in those impls' own CI: each
+# implementation repo is responsible for proving its bridge passes the
+# full matrix when paired with reference. Keeping them out of this
+# workflow means a missing command on, say, the swift bridge doesn't
+# block a harness-only fix from landing here.
 
 on:
   push:
@@ -15,24 +20,14 @@ on:
 
 jobs:
   conformance:
-    # macOS: Swift 5.9+ is preinstalled on macos-14 runners and the
-    # swift bridge build uses CryptoKit which requires Apple platforms.
-    # macOS-14 also runs the python side comfortably (markqvist/LXMF
-    # has no Linux-only deps).
-    runs-on: macos-14
-    timeout-minutes: 25
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
 
     steps:
       - name: Checkout lxmf-conformance
         uses: actions/checkout@v4
         with:
           path: lxmf-conformance
-
-      - name: Checkout LXMF-swift
-        uses: actions/checkout@v4
-        with:
-          repository: torlando-tech/LXMF-swift
-          path: LXMF-swift
 
       - name: Checkout Reticulum (Python reference)
         uses: actions/checkout@v4
@@ -64,19 +59,13 @@ jobs:
           # entries for those repos cover their own deps.
           pip install pytest cryptography pyserial msgpack
 
-      - name: Build LXMF-swift conformance bridge
-        working-directory: LXMF-swift
-        # Release mode for parity with how the swift bridge will run
-        # in production-equivalent benchmarks; debug also works.
-        run: swift build -c release --product LXMFConformanceBridge
-
-      - name: Run cross-impl conformance tests
+      - name: Run reference (python) conformance tests
         working-directory: lxmf-conformance
         env:
           PYTHON_RNS_PATH: ${{ github.workspace }}/Reticulum
           PYTHON_LXMF_PATH: ${{ github.workspace }}/LXMF
-          # Pin the swift bridge path so conftest.py auto-detection
-          # doesn't depend on relative-path conventions inside the
-          # GitHub Actions checkout layout.
-          CONFORMANCE_SWIFT_BRIDGE_CMD: ${{ github.workspace }}/LXMF-swift/.build/release/LXMFConformanceBridge
-        run: python -m pytest tests/ -v --tb=short
+        # --impls python forces the parametrize fixtures to skip every
+        # cross-impl combination involving swift / kotlin. The harness
+        # repo's CI proves only the harness itself; per-impl bridge CI
+        # runs the full matrix in each implementation's own repo.
+        run: python -m pytest tests/ -v --tb=short --impls python
