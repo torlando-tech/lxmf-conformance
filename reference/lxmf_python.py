@@ -1185,12 +1185,21 @@ def _main():
     is the convention).
     """
     print("READY", flush=True)
+    # After READY, route any further stdout writes to stderr. RNS.log
+    # writes to sys.stdout by default and would otherwise leak onto the
+    # JSON-RPC response channel, where the test harness silently drops
+    # them as non-JSON. Reroute so that diagnostics from the underlying
+    # RNS / LXMF stack are visible to anyone running the conformance suite.
+    # The JSON-RPC writes below use a captured stdout reference so they
+    # still go to the real stdout.
+    _stdout_for_rpc = sys.stdout
+    sys.stdout = sys.stderr
     for line in sys.stdin:
         line = line.strip()
         if not line:
             continue
         response = _handle_request(line)
-        print(json.dumps(response), flush=True)
+        print(json.dumps(response), flush=True, file=_stdout_for_rpc)
 
 
 if __name__ == "__main__":
