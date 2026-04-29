@@ -20,9 +20,11 @@ in sync so contributors familiar with one suite can navigate the other
 without surprises.
 """
 
+import collections
 import json
 import os
 import subprocess
+import threading
 import time
 
 
@@ -84,6 +86,22 @@ class BridgeClient:
             pass_fds=tuple(pass_fds),
         )
 
+        # Drain stderr in a background thread. Without this, verbose
+        # stderr output from a bridge (e.g. RNS.log() at LOG_DEBUG, or
+        # any println-equivalent in the kotlin/swift bridges) fills the
+        # OS pipe buffer (~64 KB) mid-test and the bridge subprocess
+        # BLOCKS on its next stderr write. That stall manifests as
+        # tests that hang past the per-test timeout, with the bridge
+        # appearing to have "stopped responding" — but it's actually
+        # the harness that's wedged. Same root cause as the test-infra
+        # deadlock fixed in reticulum-conformance#22; ported here.
+        # Tail of recent stderr is preserved for crash diagnostics.
+        self._stderr_tail = collections.deque(maxlen=200)
+        self._stderr_thread = threading.Thread(
+            target=self._drain_stderr, daemon=True
+        )
+        self._stderr_thread.start()
+
         # Wait for READY. Anything emitted before READY is treated as a
         # warning and skipped — RNS prints "Reticulum...starting" on
         # stdout before the bridge handler installs.
@@ -92,15 +110,35 @@ class BridgeClient:
             line = self._proc.stdout.readline()
             if not line:
                 if self._proc.poll() is not None:
-                    stderr = self._proc.stderr.read()
                     raise BridgeError(
                         f"Bridge process exited before READY (code "
-                        f"{self._proc.returncode}). Stderr:\n{stderr}"
+                        f"{self._proc.returncode}). Stderr:\n"
+                        f"{self._stderr_snapshot()}"
                     )
                 continue
             if line.strip() == "READY":
                 return
         raise BridgeError(f"Bridge did not send READY within {timeout}s")
+
+    def _drain_stderr(self):
+        """Background drainer for the bridge's stderr pipe.
+
+        Reads line-by-line and stashes the last N lines for diagnostic
+        use. Critical for any bridge that logs verbosely on stderr —
+        without it the kernel pipe buffer fills and the bridge blocks
+        mid-operation. Same pattern as the equivalent fix in
+        reticulum-conformance/bridge_client.py.
+        """
+        try:
+            for line in iter(self._proc.stderr.readline, ""):
+                self._stderr_tail.append(line)
+        except Exception:
+            pass
+
+    def _stderr_snapshot(self):
+        """Return the last few hundred lines of bridge stderr for error
+        context. The drain thread keeps this current in real time."""
+        return "".join(self._stderr_tail)
 
     def execute(self, command, **params):
         """Send a command and block until the response arrives.
@@ -131,9 +169,9 @@ class BridgeClient:
         while True:
             response_line = self._proc.stdout.readline()
             if not response_line:
-                stderr = self._proc.stderr.read()
                 raise BridgeError(
-                    f"Bridge closed stdout (stderr: {stderr})", command=command
+                    f"Bridge closed stdout (stderr: {self._stderr_snapshot()})",
+                    command=command,
                 )
             if response_line.strip().startswith("{"):
                 break
@@ -158,6 +196,13 @@ class BridgeClient:
             except subprocess.TimeoutExpired:
                 self._proc.kill()
                 self._proc.wait()
+        # Drain any final stderr lines into _stderr_tail before callers
+        # (typically test teardown catching a BridgeError) inspect the
+        # snapshot. The thread exits naturally as soon as stderr hits
+        # EOF post-wait; bound the join so a misbehaving bridge can't
+        # wedge teardown.
+        if hasattr(self, "_stderr_thread"):
+            self._stderr_thread.join(timeout=2)
 
     def __enter__(self):
         return self
