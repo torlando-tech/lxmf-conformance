@@ -162,6 +162,17 @@ class _BridgeState:
         self._outbound_state: dict[bytes, str] = {}
         self._outbound_lock = threading.Lock()
 
+        # Live LXMessage references keyed by message hash. Used by
+        # ``cmd_lxmf_get_message_state`` to read the current
+        # ``message.state`` directly. Necessary because LXMF's
+        # ``register_delivery_callback`` only fires on terminal-for-
+        # method transitions (DELIVERED for opportunistic, SENT for
+        # propagated). The intermediate transitions (OUTBOUND→SENDING,
+        # SENDING→SENT-not-yet-delivered) never fire any callback, so
+        # polling _outbound_state alone reports a stale 'outbound'
+        # even after the message has actually advanced.
+        self._outbound_messages: dict[bytes, "LXMF.LXMessage"] = {}
+
         self._interfaces: list[FdPipeInterface] = []
 
 
@@ -679,6 +690,15 @@ def cmd_lxmf_send_opportunistic(params):
     if msg_hash:
         with _state._outbound_lock:
             _state._outbound_state[msg_hash] = _state_to_string(message.state)
+            # Keep a live reference so cmd_lxmf_get_message_state can
+            # read the current message.state directly. The router
+            # advances state through OUTBOUND → SENDING → SENT →
+            # DELIVERED but only invokes the registered callback at
+            # terminal-for-method (DELIVERED for opportunistic, SENT
+            # for propagated). The intermediate transitions never
+            # reach _outbound_state, so polling it alone misses
+            # progress that already happened on the message.
+            _state._outbound_messages[msg_hash] = message
 
     return {"message_hash": msg_hash.hex()}
 
@@ -756,6 +776,15 @@ def cmd_lxmf_send_direct(params):
     if msg_hash:
         with _state._outbound_lock:
             _state._outbound_state[msg_hash] = _state_to_string(message.state)
+            # Keep a live reference so cmd_lxmf_get_message_state can
+            # read the current message.state directly. The router
+            # advances state through OUTBOUND → SENDING → SENT →
+            # DELIVERED but only invokes the registered callback at
+            # terminal-for-method (DELIVERED for opportunistic, SENT
+            # for propagated). The intermediate transitions never
+            # reach _outbound_state, so polling it alone misses
+            # progress that already happened on the message.
+            _state._outbound_messages[msg_hash] = message
 
     return {"message_hash": msg_hash.hex()}
 
@@ -897,6 +926,15 @@ def cmd_lxmf_send_propagated(params):
     if msg_hash:
         with _state._outbound_lock:
             _state._outbound_state[msg_hash] = _state_to_string(message.state)
+            # Keep a live reference so cmd_lxmf_get_message_state can
+            # read the current message.state directly. The router
+            # advances state through OUTBOUND → SENDING → SENT →
+            # DELIVERED but only invokes the registered callback at
+            # terminal-for-method (DELIVERED for opportunistic, SENT
+            # for propagated). The intermediate transitions never
+            # reach _outbound_state, so polling it alone misses
+            # progress that already happened on the message.
+            _state._outbound_messages[msg_hash] = message
     return {"message_hash": msg_hash.hex()}
 
 
@@ -1000,6 +1038,24 @@ def cmd_lxmf_get_message_state(params):
     msg_hash = bytes.fromhex(params["message_hash"])
     with _state._outbound_lock:
         state = _state._outbound_state.get(msg_hash, "unknown")
+        live_message = _state._outbound_messages.get(msg_hash)
+
+    # Prefer the recorded state when it's already terminal-for-bridge
+    # (delivered/failed) — those values are authoritative because they
+    # come from the actual delivery/failed callback firings. Otherwise
+    # fall back to the live LXMessage.state. The router progresses
+    # OUTBOUND → SENDING → SENT → DELIVERED but only invokes the
+    # registered callback at terminal-for-method (DELIVERED for
+    # opportunistic, SENT for propagated). Intermediate transitions
+    # (e.g. propagated OUTBOUND→SENDING after the resource transfer
+    # starts) never reach _outbound_state, so polling it alone reports
+    # a stale 'outbound' even after the message has actually advanced.
+    if state not in {"delivered", "failed"} and live_message is not None:
+        live_state = _state_to_string(live_message.state)
+        # Don't downgrade a recorded "sent" with a re-read that happens
+        # to land on "outbound" between transitions.
+        if live_state != "outbound" or state == "unknown":
+            state = live_state
 
     # If we haven't heard back via the per-message callback yet, walk
     # LXMF's failed_outbound list as a fallback. Delivered state always
@@ -1061,6 +1117,10 @@ def cmd_lxmf_shutdown(params):
     _state.identity = None
     _state.delivery_destination = None
     _state.reticulum = None
+
+    with _state._outbound_lock:
+        _state._outbound_state.clear()
+        _state._outbound_messages.clear()
 
     return {"stopped": stopped}
 
