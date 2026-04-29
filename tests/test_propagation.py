@@ -30,7 +30,19 @@ import pytest
 def test_propagated_message_via_pn(sender_impl, receiver_impl, tcp_trio):
     sender, pn, receiver = tcp_trio
 
-    content = f"prop-{secrets.token_hex(8)}"
+    # Pad the content to force RESOURCE representation on the wire
+    # (rather than single-PACKET, which python LXMF picks for small
+    # payloads that fit under LINK_PACKET_MAX_CONTENT ≈ 180-200 bytes
+    # in `LXMessage.pack` at LXMessage.py:444). The dedicated
+    # propagation invariant assertion below greps lxmd's per-resource
+    # log line, which only fires for the RESOURCE code path
+    # (`propagation_resource_concluded`); the PACKET path goes through
+    # a different lxmd handler that doesn't surface the
+    # identified-vs-anonymous remote distinction in the same way.
+    # Forcing RESOURCE keeps the cross-impl test exercising the same
+    # lxmd code path regardless of sender impl.
+    padding = "x" * 512
+    content = f"prop-{secrets.token_hex(8)}-{padding}"
     title = f"prop-title-{secrets.token_hex(4)}"
 
     message_hash = sender.send_propagated(
@@ -70,6 +82,70 @@ def test_propagated_message_via_pn(sender_impl, receiver_impl, tcp_trio):
         f"sender ({sender_impl}) outbound state for propagated "
         f"message is {upload_state!r}, expected `sent` or `delivered` "
         f"within 90s — sender failed to upload to PN"
+    )
+
+    # ---- Conformance invariant: sender did NOT identify on the link
+    # to the PN for the delivery transfer. Python LXMF's
+    # `process_outbound` for PROPAGATED (LXMRouter.py:2700-2704)
+    # establishes the link to the propagation node and goes straight
+    # to sending the resource — `link.identify(...)` is reserved for
+    # the *retrieval* path (LXMRouter.py:493). Identifying on the
+    # delivery link causes lxmd's `propagation_resource_concluded`
+    # (LXMRouter.py:2188-2214) to run its peer-discovery branch
+    # (`RNS.Destination(remote_identity, OUT, SINGLE, "lxmf",
+    # "propagation")` then `recall_app_data`), which serializes
+    # against the proof emission and adds latency.
+    #
+    # We detect the invariant via lxmd's own stderr at LOG_VERBOSE
+    # (LxmdPropagationNode default): the per-resource line is
+    #
+    #   "Received N message{s} from {remote_str}, validating stamps..."
+    #
+    # where `remote_str` is `"unknown client"` when the link wasn't
+    # identified, or `RNS.prettyhexrep(remote_hash)` (a hex hash, with
+    # an optional `peer ` prefix for known peers) when it was.
+    #
+    # An impl that erroneously identifies on the delivery link still
+    # has its message uploaded successfully — the assertion above will
+    # pass — but lxmd takes a slower path and the asymmetry is
+    # observable in cross-impl conformance (kotlin->python ~2x slower
+    # than kotlin->kotlin). This invariant catches the misbehavior
+    # directly, regardless of the perf observable.
+    # `pn.lxmd_proc` is the LxmdPropagationNode managing the lxmd
+    # subprocess (set in conftest.py:519). Use `stdout_tail()` rather
+    # than `stderr_tail()` — lxmd is spawned with `-v` (verbose console)
+    # which routes RNS.log output to stdout. Stderr only catches
+    # subprocess-level errors and python tracebacks.
+    log_output = pn.lxmd_proc.stdout_tail(n_bytes=8000)
+
+    # Find the per-resource log line(s) for this transfer. There may be
+    # multiple resource transfers in flight if the test order overlaps;
+    # filter to the lines emitted during this test by matching the
+    # validating-stamps marker.
+    received_lines = [
+        ln for ln in log_output.splitlines()
+        if "validating stamps" in ln and "Received" in ln and " from " in ln
+    ]
+    assert received_lines, (
+        f"Could not find the lxmd 'Received N message... from <remote_str>' "
+        f"log line in stdout. lxmd may not be running at LOG_VERBOSE — "
+        f"check LxmdPropagationNode's `loglevel` default (must be >= 5) "
+        f"and that the `-v` console flag is still set on the lxmd "
+        f"command line in `_lxmd_pn.py`.\n"
+        f"stdout tail (last 2000 chars):\n{log_output[-2000:]}"
+    )
+    # Take the last matching line — most recent transfer for this test.
+    last_line = received_lines[-1]
+    assert "from unknown client" in last_line, (
+        f"sender ({sender_impl}) appears to have IDENTIFIED on the "
+        f"delivery link to the PN. Python LXMF's PROPAGATED outbound "
+        f"path establishes an unidentified link (LXMRouter.py:2700-"
+        f"2704); identifying causes lxmd to run its peer-discovery "
+        f"branch on every resource conclusion, which serializes "
+        f"against proof emission and breaks cross-impl interop "
+        f"performance. Fix: do NOT call `link.identify(...)` on the "
+        f"propagation link when sending; identify is only for the "
+        f"retrieval/sync path.\nlxmd log line: {last_line!r}"
     )
 
     # ---- Receiver syncs from PN --------------------------------
