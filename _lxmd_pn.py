@@ -182,8 +182,15 @@ class LxmdPropagationNode:
     def __init__(
         self,
         announce_interval_minutes: int = 1,
-        loglevel: int = 4,
+        loglevel: int = 5,
     ) -> None:
+        # Default loglevel = 5 (LOG_VERBOSE) so the per-resource line
+        # `Received N message{s} from {remote_str}, validating stamps...`
+        # in `LXMRouter.propagation_resource_concluded` (LXMRouter.py:2227)
+        # is captured in lxmd's stderr. The "no identify on delivery link"
+        # conformance assertion in `test_propagation.py` greps that line
+        # to verify `remote_str == "unknown client"`. INFO (4) hides the
+        # line; VERBOSE (5) is the minimum that surfaces it.
         # lxmd's config parser reads `announce_interval` as an int (minutes,
         # multiplied by 60). Tests get the initial announce via
         # `announce_at_start = yes`; the periodic interval is mostly a
@@ -281,7 +288,15 @@ class LxmdPropagationNode:
                 "--config",
                 self._lxmd_dir,
                 "--propagation-node",
-                "-v",
+                # `-vv` (count==2) raises lxmd's console loglevel to
+                # LOG_VERBOSE (5), which is what surfaces the per-
+                # resource line `Received N message{s} from {remote_str}`
+                # in `LXMRouter.propagation_resource_concluded`. The
+                # conformance assertion in `test_propagation.py` greps
+                # that line to verify `remote_str == "unknown client"`
+                # (delivery link must be unidentified). `-v` alone
+                # (INFO level) hides that line.
+                "-vv",
             ],
             stdin=subprocess.DEVNULL,
             stdout=self._stdout_fh,
@@ -336,6 +351,25 @@ class LxmdPropagationNode:
         if not os.path.exists(self._stderr_path):
             return ""
         with open(self._stderr_path, "rb") as fh:
+            try:
+                fh.seek(-n_bytes, os.SEEK_END)
+            except OSError:
+                fh.seek(0)
+            return fh.read().decode("utf-8", errors="replace")
+
+    def stdout_tail(self, n_bytes: int = 4000) -> str:
+        """Most recent stdout bytes from the lxmd subprocess.
+
+        lxmd is launched with `-v` (above), which routes RNS.log
+        output to console (stdout), not the rnsconfig file logger.
+        Conformance tests that introspect lxmd's per-resource log
+        lines (e.g. `Received N message{s} from {remote_str}`,
+        emitted by `LXMRouter.propagation_resource_concluded` at
+        LOG_VERBOSE) need this method, not `stderr_tail()`.
+        """
+        if not os.path.exists(self._stdout_path):
+            return ""
+        with open(self._stdout_path, "rb") as fh:
             try:
                 fh.seek(-n_bytes, os.SEEK_END)
             except OSError:
