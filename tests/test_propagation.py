@@ -22,12 +22,11 @@ import pytest
 
 
 # Override the 60s global pytest-timeout for propagation. Worst-case
-# budget = ~15s tcp_trio fixture + 60s upload deadline + 1s settle +
-# 3×30s sync_inbound retries + 2×2s noPath backoff + ~15s drain ≈ 185s.
-# The retry path and a slow upload are unlikely to coincide, but 240s
-# leaves visible headroom against both at once while still catching a
-# real hang.
-@pytest.mark.timeout(240)
+# budget = ~15s tcp_trio fixture + 90s upload deadline + 1s settle +
+# 3×30s sync_inbound retries + 2×2s noPath backoff + ~15s drain ≈ 215s.
+# 300s leaves visible headroom against the worst case while still
+# catching a real hang.
+@pytest.mark.timeout(300)
 def test_propagated_message_via_pn(sender_impl, receiver_impl, tcp_trio):
     sender, pn, receiver = tcp_trio
 
@@ -50,13 +49,17 @@ def test_propagated_message_via_pn(sender_impl, receiver_impl, tcp_trio):
     # sync, but PROPAGATED on the sender side is "done" once the PN
     # accepts the upload.
     #
-    # Deadline was 30s and held locally (~7-11s per kotlin->kotlin
-    # propagation) but on GitHub-hosted ubuntu runners (2 cores,
-    # ~7GB RAM, multiple JVM bridges + lxmd contending for the same
-    # CPU) the resource transfer routinely needs 30-50s. The transfer
-    # itself completes — the 30s window just clipped it. 60s gives
-    # ~2x local headroom against the ~3x observed CI slowdown.
-    upload_deadline = time.time() + 60.0
+    # Deadline was originally 30s, then bumped to 60s when the kotlin
+    # bridge started reaching SENDING but not SENT in time. Bumped
+    # again to 90s after a `taskset -c 0,1` local repro showed the
+    # kotlin sender's Resource transfer takes 44-61s on 2 cores —
+    # CI's 60s window was clipping the long tail. 90s gives ~50%
+    # headroom over the observed worst case.
+    #
+    # The underlying gap (kotlin sender ~3-5x slower than python on
+    # the same hardware) is tracked in reticulum-kt#65; this deadline
+    # is a band-aid until that lands.
+    upload_deadline = time.time() + 90.0
     upload_state = None
     while time.time() < upload_deadline:
         upload_state = sender.message_state(message_hash)
@@ -66,7 +69,7 @@ def test_propagated_message_via_pn(sender_impl, receiver_impl, tcp_trio):
     assert upload_state in {"sent", "delivered"}, (
         f"sender ({sender_impl}) outbound state for propagated "
         f"message is {upload_state!r}, expected `sent` or `delivered` "
-        f"within 60s — sender failed to upload to PN"
+        f"within 90s — sender failed to upload to PN"
     )
 
     # ---- Receiver syncs from PN --------------------------------
