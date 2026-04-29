@@ -22,11 +22,11 @@ import pytest
 
 
 # Override the 60s global pytest-timeout for propagation. Worst-case
-# budget = ~15s tcp_trio fixture + 90s upload deadline + 1s settle +
-# 3×30s sync_inbound retries + 2×2s noPath backoff + ~15s drain ≈ 215s.
-# 300s leaves visible headroom against the worst case while still
+# budget = ~15s tcp_trio fixture + 120s upload deadline + 1s settle +
+# 3×30s sync_inbound retries + 2×2s noPath backoff + ~15s drain ≈ 245s.
+# 360s leaves visible headroom against the worst case while still
 # catching a real hang.
-@pytest.mark.timeout(300)
+@pytest.mark.timeout(360)
 def test_propagated_message_via_pn(sender_impl, receiver_impl, tcp_trio):
     sender, pn, receiver = tcp_trio
 
@@ -61,17 +61,20 @@ def test_propagated_message_via_pn(sender_impl, receiver_impl, tcp_trio):
     # sync, but PROPAGATED on the sender side is "done" once the PN
     # accepts the upload.
     #
-    # Deadline was originally 30s, then bumped to 60s when the kotlin
-    # bridge started reaching SENDING but not SENT in time. Bumped
-    # again to 90s after a `taskset -c 0,1` local repro showed the
-    # kotlin sender's Resource transfer takes 44-61s on 2 cores —
-    # CI's 60s window was clipping the long tail. 90s gives ~50%
-    # headroom over the observed worst case.
-    #
-    # The underlying gap (kotlin sender ~3-5x slower than python on
-    # the same hardware) is tracked in reticulum-kt#65; this deadline
-    # is a band-aid until that lands.
-    upload_deadline = time.time() + 90.0
+    # Deadline was originally 30s, bumped to 60s, then 90s as the
+    # kotlin sender's Resource transfer perf gap surfaced under
+    # 2-core CI load. Bumped again to 120s: even with reticulum-kt#64
+    # merged (lock-release, dedup, watchdog cleanup, identity-CAS),
+    # the `kotlin->lxmd_pn->python` variant consistently exceeds 90s
+    # on GitHub-hosted runners (1.5-2x slower than local 2-core).
+    # `kotlin->lxmd_pn->kotlin` typically runs in ~25s on the same
+    # CI; the asymmetry suggests the python receiver bridge competes
+    # for CPU with the sender during the upload window in a way the
+    # kotlin receiver bridge does not. Worth dedicated investigation
+    # — but the underlying perf gap (kotlin Resource transfer is
+    # 3-5x slower than python's equivalent) is tracked in
+    # reticulum-kt#65 and this deadline is a band-aid until it lands.
+    upload_deadline = time.time() + 120.0
     upload_state = None
     while time.time() < upload_deadline:
         upload_state = sender.message_state(message_hash)
@@ -81,7 +84,7 @@ def test_propagated_message_via_pn(sender_impl, receiver_impl, tcp_trio):
     assert upload_state in {"sent", "delivered"}, (
         f"sender ({sender_impl}) outbound state for propagated "
         f"message is {upload_state!r}, expected `sent` or `delivered` "
-        f"within 90s — sender failed to upload to PN"
+        f"within 120s — sender failed to upload to PN"
     )
 
     # ---- Conformance invariant: sender did NOT identify on the link
