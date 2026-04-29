@@ -162,6 +162,17 @@ class _BridgeState:
         self._outbound_state: dict[bytes, str] = {}
         self._outbound_lock = threading.Lock()
 
+        # Live LXMessage references keyed by message hash. Used by
+        # ``cmd_lxmf_get_message_state`` to read the current
+        # ``message.state`` directly. Necessary because LXMF's
+        # ``register_delivery_callback`` only fires on terminal-for-
+        # method transitions (DELIVERED for opportunistic, SENT for
+        # propagated). The intermediate transitions (OUTBOUND→SENDING,
+        # SENDING→SENT-not-yet-delivered) never fire any callback, so
+        # polling _outbound_state alone reports a stale 'outbound'
+        # even after the message has actually advanced.
+        self._outbound_messages: dict[bytes, "LXMF.LXMessage"] = {}
+
         self._interfaces: list[FdPipeInterface] = []
 
 
@@ -647,7 +658,15 @@ def cmd_lxmf_send_opportunistic(params):
     def state_callback(msg):
         if msg.hash:
             with _state._outbound_lock:
-                _state._outbound_state[msg.hash] = _state_to_string(msg.state)
+                new_state = _state_to_string(msg.state)
+                _state._outbound_state[msg.hash] = new_state
+                # Drop the live-message reference once the state is
+                # terminal-for-bridge — at that point _outbound_state
+                # holds the authoritative value and nothing else needs
+                # the LXMessage object. Without this, the map grows
+                # for the lifetime of the bridge process.
+                if new_state in {"delivered", "failed"}:
+                    _state._outbound_messages.pop(msg.hash, None)
 
     message = LXMF.LXMessage(
         destination=recipient_destination,
@@ -679,6 +698,15 @@ def cmd_lxmf_send_opportunistic(params):
     if msg_hash:
         with _state._outbound_lock:
             _state._outbound_state[msg_hash] = _state_to_string(message.state)
+            # Keep a live reference so cmd_lxmf_get_message_state can
+            # read the current message.state directly. The router
+            # advances state through OUTBOUND → SENDING → SENT →
+            # DELIVERED but only invokes the registered callback at
+            # terminal-for-method (DELIVERED for opportunistic, SENT
+            # for propagated). The intermediate transitions never
+            # reach _outbound_state, so polling it alone misses
+            # progress that already happened on the message.
+            _state._outbound_messages[msg_hash] = message
 
     return {"message_hash": msg_hash.hex()}
 
@@ -737,7 +765,15 @@ def cmd_lxmf_send_direct(params):
     def state_callback(msg):
         if msg.hash:
             with _state._outbound_lock:
-                _state._outbound_state[msg.hash] = _state_to_string(msg.state)
+                new_state = _state_to_string(msg.state)
+                _state._outbound_state[msg.hash] = new_state
+                # Drop the live-message reference once the state is
+                # terminal-for-bridge — at that point _outbound_state
+                # holds the authoritative value and nothing else needs
+                # the LXMessage object. Without this, the map grows
+                # for the lifetime of the bridge process.
+                if new_state in {"delivered", "failed"}:
+                    _state._outbound_messages.pop(msg.hash, None)
 
     message = LXMF.LXMessage(
         destination=recipient_destination,
@@ -756,6 +792,15 @@ def cmd_lxmf_send_direct(params):
     if msg_hash:
         with _state._outbound_lock:
             _state._outbound_state[msg_hash] = _state_to_string(message.state)
+            # Keep a live reference so cmd_lxmf_get_message_state can
+            # read the current message.state directly. The router
+            # advances state through OUTBOUND → SENDING → SENT →
+            # DELIVERED but only invokes the registered callback at
+            # terminal-for-method (DELIVERED for opportunistic, SENT
+            # for propagated). The intermediate transitions never
+            # reach _outbound_state, so polling it alone misses
+            # progress that already happened on the message.
+            _state._outbound_messages[msg_hash] = message
 
     return {"message_hash": msg_hash.hex()}
 
@@ -879,7 +924,15 @@ def cmd_lxmf_send_propagated(params):
     def state_callback(msg):
         if msg.hash:
             with _state._outbound_lock:
-                _state._outbound_state[msg.hash] = _state_to_string(msg.state)
+                new_state = _state_to_string(msg.state)
+                _state._outbound_state[msg.hash] = new_state
+                # Drop the live-message reference once the state is
+                # terminal-for-bridge — at that point _outbound_state
+                # holds the authoritative value and nothing else needs
+                # the LXMessage object. Without this, the map grows
+                # for the lifetime of the bridge process.
+                if new_state in {"delivered", "failed"}:
+                    _state._outbound_messages.pop(msg.hash, None)
 
     message = LXMF.LXMessage(
         destination=recipient_destination,
@@ -897,6 +950,15 @@ def cmd_lxmf_send_propagated(params):
     if msg_hash:
         with _state._outbound_lock:
             _state._outbound_state[msg_hash] = _state_to_string(message.state)
+            # Keep a live reference so cmd_lxmf_get_message_state can
+            # read the current message.state directly. The router
+            # advances state through OUTBOUND → SENDING → SENT →
+            # DELIVERED but only invokes the registered callback at
+            # terminal-for-method (DELIVERED for opportunistic, SENT
+            # for propagated). The intermediate transitions never
+            # reach _outbound_state, so polling it alone misses
+            # progress that already happened on the message.
+            _state._outbound_messages[msg_hash] = message
     return {"message_hash": msg_hash.hex()}
 
 
@@ -1000,6 +1062,30 @@ def cmd_lxmf_get_message_state(params):
     msg_hash = bytes.fromhex(params["message_hash"])
     with _state._outbound_lock:
         state = _state._outbound_state.get(msg_hash, "unknown")
+        live_message = _state._outbound_messages.get(msg_hash)
+        # Read live_message.state inside the lock so the map lookup
+        # and the attribute read happen atomically with respect to
+        # other threads calling cmd_lxmf_get_message_state. The lock
+        # does NOT synchronize with LXMF's writer thread (it doesn't
+        # hold our lock), but a single attribute read is GIL-atomic
+        # in CPython, which is the only python the bridge supports.
+        live_state = (
+            _state_to_string(live_message.state)
+            if live_message is not None
+            else None
+        )
+
+    # Prefer the recorded state when it's already terminal-for-bridge
+    # (delivered/failed) — those values are authoritative because they
+    # come from the actual delivery/failed callback firings. Otherwise
+    # consider the live LXMessage.state, but never downgrade ordinally:
+    # the router progresses OUTBOUND → SENDING → SENT → DELIVERED, and
+    # _outbound_state can be ahead of live_message.state if the
+    # callback fired for SENT while the LXMessage object briefly shows
+    # SENDING in a re-read window. Use ordinal comparison so the merged
+    # value is always the most-advanced state we can prove.
+    if live_state is not None and _STATE_ORDER.get(live_state, 0) > _STATE_ORDER.get(state, 0):
+        state = live_state
 
     # If we haven't heard back via the per-message callback yet, walk
     # LXMF's failed_outbound list as a fallback. Delivered state always
@@ -1062,6 +1148,10 @@ def cmd_lxmf_shutdown(params):
     _state.delivery_destination = None
     _state.reticulum = None
 
+    with _state._outbound_lock:
+        _state._outbound_state.clear()
+        _state._outbound_messages.clear()
+
     return {"stopped": stopped}
 
 
@@ -1111,6 +1201,21 @@ def _state_to_string(state):
         LXMF.LXMessage.FAILED: "failed",
     }
     return constants.get(state, f"state_{state}")
+
+
+# Strict monotone progression of bridge-visible state names. Used by
+# cmd_lxmf_get_message_state to merge a callback-driven recorded state
+# with a live LXMessage.state read without ever moving backwards. Any
+# unknown / non-canonical name maps to 0 so it loses to any known state.
+_STATE_ORDER = {
+    "unknown": 0,
+    "generating": 1,
+    "outbound": 2,
+    "sending": 3,
+    "sent": 4,
+    "delivered": 5,
+    "failed": 5,
+}
 
 
 def _ack_status_to_string(_attempts, method_name):
