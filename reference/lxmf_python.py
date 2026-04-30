@@ -1103,6 +1103,108 @@ def cmd_lxmf_get_message_state(params):
     return {"state": state}
 
 
+def cmd_lxmf_decode_bytes(params):
+    """Decode raw LXMF wire bytes and return parsed components + computed hash.
+
+    Byte-level conformance command. Does NOT require ``lxmf_init`` —
+    operates on the LXMessage decoder in isolation, parallel to the
+    bridge's lifecycle commands. The whole point is to exercise the
+    msgpack/payload parsing layer directly, against payload shapes
+    that may be impossible to elicit through normal send commands
+    (e.g. a fields slot encoded as msgpack Nil, which python's own
+    sender never emits but iOS LXMF does).
+
+    Params:
+      - ``lxmf_bytes`` (hex): full LXMF wire bytes,
+        ``destination_hash + source_hash + signature + packed_payload``.
+        Signature is NOT validated here — bytes can be crafted with
+        a dummy signature for protocol-shape testing.
+
+    Returns (success):
+      - ``destination_hash`` (hex)
+      - ``source_hash`` (hex)
+      - ``signature`` (hex)
+      - ``timestamp`` (float)
+      - ``title_hex`` (hex)  — title bytes (LXMF stores title as bytes)
+      - ``content_hex`` (hex)
+      - ``fields_was_nil`` (bool)  — was the fields slot encoded as msgpack Nil?
+      - ``fields_count`` (int)  — entry count after normalization (Nil -> {})
+      - ``stamp`` (hex | null)  — stamp bytes if 5-element payload, else null
+      - ``message_hash`` (hex)  — hash computed during decode (must match
+        what the sender wrote)
+
+    Returns (failure):
+      - ``decode_error`` (str)  — exception class + message
+    """
+    import hashlib
+    import RNS.vendor.umsgpack as _umsgpack
+
+    DEST_LEN = 16   # LXMessage.DESTINATION_LENGTH
+    SIG_LEN = 64    # LXMessage.SIGNATURE_LENGTH
+
+    try:
+        lxmf_bytes = bytes.fromhex(params["lxmf_bytes"])
+    except Exception as e:
+        return {"decode_error": f"hex parse: {type(e).__name__}: {e}"}
+
+    if len(lxmf_bytes) < 2 * DEST_LEN + SIG_LEN:
+        return {"decode_error": f"lxmf_bytes too short: {len(lxmf_bytes)}"}
+
+    destination_hash = lxmf_bytes[:DEST_LEN]
+    source_hash = lxmf_bytes[DEST_LEN:2 * DEST_LEN]
+    signature = lxmf_bytes[2 * DEST_LEN:2 * DEST_LEN + SIG_LEN]
+    packed_payload = lxmf_bytes[2 * DEST_LEN + SIG_LEN:]
+
+    try:
+        unpacked_payload = _umsgpack.unpackb(packed_payload)
+    except Exception as e:
+        return {"decode_error": f"msgpack unpack: {type(e).__name__}: {e}"}
+
+    if not isinstance(unpacked_payload, list) or len(unpacked_payload) < 4:
+        return {
+            "decode_error": (
+                f"payload not a list of >=4 elements: type={type(unpacked_payload).__name__} "
+                f"len={len(unpacked_payload) if hasattr(unpacked_payload, '__len__') else 'n/a'}"
+            )
+        }
+
+    # Mirror LXMessage.py:742-749 — only re-pack when stamp present.
+    stamp = None
+    if len(unpacked_payload) > 4:
+        stamp = unpacked_payload[4]
+        unpacked_payload = unpacked_payload[:4]
+        try:
+            packed_payload = _umsgpack.packb(unpacked_payload)
+        except Exception as e:
+            return {"decode_error": f"msgpack repack: {type(e).__name__}: {e}"}
+
+    # Compute hash on (possibly re-packed) 4-element payload bytes.
+    hashed_part = destination_hash + source_hash + packed_payload
+    message_hash = hashlib.sha256(hashed_part).digest()
+
+    timestamp = unpacked_payload[0]
+    title_bytes = unpacked_payload[1] or b""
+    content_bytes = unpacked_payload[2] or b""
+    fields = unpacked_payload[3]
+
+    fields_was_nil = fields is None
+    if fields_was_nil:
+        fields = {}
+
+    return {
+        "destination_hash": destination_hash.hex(),
+        "source_hash": source_hash.hex(),
+        "signature": signature.hex(),
+        "timestamp": float(timestamp),
+        "title_hex": title_bytes.hex() if isinstance(title_bytes, (bytes, bytearray)) else b"".hex(),
+        "content_hex": content_bytes.hex() if isinstance(content_bytes, (bytes, bytearray)) else b"".hex(),
+        "fields_was_nil": fields_was_nil,
+        "fields_count": len(fields) if hasattr(fields, "__len__") else 0,
+        "stamp": stamp.hex() if isinstance(stamp, (bytes, bytearray)) else None,
+        "message_hash": message_hash.hex(),
+    }
+
+
 def cmd_lxmf_shutdown(params):
     """Tear down RNS, LXMF, and any pipe interfaces.
 
@@ -1250,6 +1352,7 @@ COMMANDS = {
     "lxmf_sync_inbound": cmd_lxmf_sync_inbound,
     "lxmf_get_received_messages": cmd_lxmf_get_received_messages,
     "lxmf_get_message_state": cmd_lxmf_get_message_state,
+    "lxmf_decode_bytes": cmd_lxmf_decode_bytes,
     "lxmf_shutdown": cmd_lxmf_shutdown,
 }
 
