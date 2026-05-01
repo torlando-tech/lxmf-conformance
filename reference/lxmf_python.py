@@ -630,6 +630,12 @@ def cmd_lxmf_send_opportunistic(params):
     content = params["content"]
     title = params.get("title", "")
     fields = _decode_fields_param(params.get("fields"))
+    # Optional explicit timestamp for tests that need byte-for-byte
+    # reproducible wire bytes (notably the dedup conformance test, where
+    # two consecutive sends must produce the same message_hash so the
+    # receiver's dedup check actually has something to compare against).
+    # When unset, LXMessage.pack() defaults to time.time() at line 362.
+    forced_timestamp = params.get("timestamp")
 
     dest_hash = bytes.fromhex(dest_hash_hex)
 
@@ -678,6 +684,13 @@ def cmd_lxmf_send_opportunistic(params):
     )
     message.register_delivery_callback(state_callback)
     message.register_failed_callback(state_callback)
+
+    # Pin timestamp BEFORE pack(). LXMessage.pack() at LXMessage.py:362
+    # only assigns time.time() when self.timestamp is None, so a pre-set
+    # value sticks. Required for the dedup test to produce two byte-
+    # identical wire forms.
+    if forced_timestamp is not None:
+        message.timestamp = float(forced_timestamp)
 
     # Pack first so we can detect silent OPPORTUNISTIC -> DIRECT upgrades
     # before they happen. ENCRYPTED_PACKET_MAX_CONTENT is checked
