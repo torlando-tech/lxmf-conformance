@@ -607,12 +607,19 @@ class _BridgeNode:
         """Emit an LXMF delivery announce."""
         self.bridge.execute("lxmf_announce")
 
-    def send_opportunistic(self, recipient_hash, content, title="", fields=None):
+    def send_opportunistic(self, recipient_hash, content, title="", fields=None,
+                           timestamp=None):
         """Send opportunistic LXMF; returns the message hash.
 
         ``fields`` is the bridge wire-format `fields` dict — keys are
         field id strings, values are tagged objects (see
         `lxmf_python.py::_decode_field_value_from_params`).
+
+        ``timestamp`` (optional float): pin the LXMessage timestamp before
+        pack(). Two sends with the same destination, source, content,
+        title, fields, and timestamp produce byte-identical wire bytes
+        and the same message_hash — required for the dedup conformance
+        test where the receiver must see the same hash twice.
         """
         params = {
             "destination_hash": recipient_hash.hex(),
@@ -621,6 +628,8 @@ class _BridgeNode:
         }
         if fields is not None:
             params["fields"] = fields
+        if timestamp is not None:
+            params["timestamp"] = float(timestamp)
         result = self.bridge.execute("lxmf_send_opportunistic", **params)
         return bytes.fromhex(result["message_hash"])
 
