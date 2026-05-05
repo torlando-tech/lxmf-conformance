@@ -36,12 +36,21 @@ BRIDGE_COMMANDS = {
     # Kotlin lands in Phase 2. The placeholder lets parametrization
     # emit kotlin-paired test IDs that pytest can xfail/skip cleanly.
     "kotlin": "java -jar {root}/../LXMF-kt/conformance-bridge/build/libs/LXMFConformanceBridge.jar",
+    # microLXMF is the C++ LXMF library (sister to LXMF-swift / LXMF-kt)
+    # built on top of attermann/microReticulum. The bridge binary
+    # currently ships only a Phase-0 skeleton — every lxmf_* command
+    # except `ping` and `lxmf_shutdown` returns "not implemented yet",
+    # so when the binary is on disk the impl is auto-detected and every
+    # cross-impl pair involving microlxmf will fail loudly until the
+    # runtime wiring lands. See microLXMF/conformance-bridge/README.md.
+    "microlxmf": "{root}/../microLXMF/conformance-bridge/build/microLXMFBridge",
 }
 
 PER_IMPL_CMD_ENV = {
     "python": "CONFORMANCE_PYTHON_BRIDGE_CMD",
     "swift": "CONFORMANCE_SWIFT_BRIDGE_CMD",
     "kotlin": "CONFORMANCE_KOTLIN_BRIDGE_CMD",
+    "microlxmf": "CONFORMANCE_MICROLXMF_BRIDGE_CMD",
 }
 
 ROOT_DIR = os.path.dirname(os.path.abspath(__file__))
