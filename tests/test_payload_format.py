@@ -153,7 +153,7 @@ def _decode_and_assert_basic(bridge, lxmf_bytes_hex, expected_hash, *,
     )
     assert resp["fields_count"] == expected_fields_count
     if expected_stamp_hex is None:
-        assert resp["stamp"] in (None,), f"expected null stamp, got {resp['stamp']!r}"
+        assert resp["stamp"] is None, f"expected null stamp, got {resp['stamp']!r}"
     else:
         assert resp["stamp"] == expected_stamp_hex
 

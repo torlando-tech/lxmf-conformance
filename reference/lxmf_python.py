@@ -1183,8 +1183,8 @@ def cmd_lxmf_decode_bytes(params):
     message_hash = hashlib.sha256(hashed_part).digest()
 
     timestamp = unpacked_payload[0]
-    title_bytes = unpacked_payload[1] or b""
-    content_bytes = unpacked_payload[2] or b""
+    title_bytes = unpacked_payload[1] if unpacked_payload[1] is not None else b""
+    content_bytes = unpacked_payload[2] if unpacked_payload[2] is not None else b""
     fields = unpacked_payload[3]
 
     fields_was_nil = fields is None
