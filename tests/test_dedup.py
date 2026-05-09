@@ -35,20 +35,22 @@ second arrival as a duplicate.
 
 Some impls might dedup on the SENDER side too (don't actually
 transmit a second message with a hash already in the outbound
-queue). If that happens, this test surfaces it as
-``second send did not transmit`` — which is itself a finding worth
-filing, but distinct from a receiver-side dedup bug.
+queue). This test cannot distinguish receiver-side dedup from
+sender-side suppression — both produce the same observable
+outcome: exactly one inbox entry for the duplicated hash. The
+test asserts the cross-impl conformance contract on the observable
+inbox behavior; pinning down which side dedupped requires
+transport-level packet observation, which is out of scope here.
+See lxmf-conformance#12 follow-up for that distinction.
 """
 
 import secrets
 import time
 
-import pytest
-
 
 # Pin a deterministic timestamp so both sends produce identical wire
 # bytes. Value is arbitrary as long as it's the same across the two
-# calls. Using a far-from-now value (Nov 2023) so any clock-skew
+# calls. Using a fixed historical value (Nov 2023) so any clock-skew
 # logic in either impl handles it the same way each time.
 PINNED_TIMESTAMP = 1700000000.0
 
