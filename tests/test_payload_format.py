@@ -310,10 +310,12 @@ def test_decode_garbage_msgpack(single_bridge):
 def test_decode_hash_matches_sender_expected(single_bridge, case_name, payload):
     """Every impl must produce the sender-expected hash for every payload shape.
 
-    This is functionally a tighter version of the per-shape tests above:
-    if the 4-element case fails, it fails here too with the case_name in
-    the test ID, making it trivial to see which shape regressed at a
-    glance in CI.
+    Narrower-but-broader counterpart to the per-shape tests above: this
+    only asserts ``message_hash`` (skips ``fields_was_nil``, ``title_hex``,
+    ``content_hex``, ``stamp``), but iterates the full shape matrix in a
+    single parametrized table so CI logs the failing ``case_name`` in
+    the test ID — trivial to see which shape regressed at a glance.
+    Use the per-shape tests above for full per-field coverage.
     """
     lxmf_bytes, _ = _build_lxmf_bytes(payload)
     expected = _expected_hash(payload[:4])  # hash always on 4-element form
