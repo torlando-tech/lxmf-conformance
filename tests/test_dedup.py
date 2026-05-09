@@ -139,7 +139,7 @@ def test_duplicate_message_hash_arrives_once_in_inbox(server_impl, client_impl, 
     )
 
 
-def test_pinned_timestamp_produces_deterministic_message_hash(server_impl, client_impl, pipe_pair):
+def test_pinned_timestamp_produces_deterministic_message_hash(server_impl, pipe_pair):
     """Sanity: confirm the test infrastructure (forced timestamp + identical
     inputs → identical hash) actually works on the sender impl.
 
