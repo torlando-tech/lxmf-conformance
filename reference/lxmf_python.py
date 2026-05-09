@@ -1182,27 +1182,35 @@ def cmd_lxmf_decode_bytes(params):
     hashed_part = destination_hash + source_hash + packed_payload
     message_hash = hashlib.sha256(hashed_part).digest()
 
-    timestamp = unpacked_payload[0]
-    title_bytes = unpacked_payload[1] if unpacked_payload[1] is not None else b""
-    content_bytes = unpacked_payload[2] if unpacked_payload[2] is not None else b""
-    fields = unpacked_payload[3]
+    # Wrap field-extraction in a try/except so an element-type mismatch
+    # (e.g. a None timestamp from packb([None, b"t", b"c", {}])) returns
+    # a structured decode_error instead of crashing the bridge process.
+    # The function's docstring contracts that every failure mode produces
+    # {"decode_error": ...}; this closes the last unguarded path.
+    try:
+        timestamp = unpacked_payload[0]
+        title_bytes = unpacked_payload[1] if unpacked_payload[1] is not None else b""
+        content_bytes = unpacked_payload[2] if unpacked_payload[2] is not None else b""
+        fields = unpacked_payload[3]
 
-    fields_was_nil = fields is None
-    if fields_was_nil:
-        fields = {}
+        fields_was_nil = fields is None
+        if fields_was_nil:
+            fields = {}
 
-    return {
-        "destination_hash": destination_hash.hex(),
-        "source_hash": source_hash.hex(),
-        "signature": signature.hex(),
-        "timestamp": float(timestamp),
-        "title_hex": title_bytes.hex() if isinstance(title_bytes, (bytes, bytearray)) else b"".hex(),
-        "content_hex": content_bytes.hex() if isinstance(content_bytes, (bytes, bytearray)) else b"".hex(),
-        "fields_was_nil": fields_was_nil,
-        "fields_count": len(fields) if hasattr(fields, "__len__") else 0,
-        "stamp": stamp.hex() if isinstance(stamp, (bytes, bytearray)) else None,
-        "message_hash": message_hash.hex(),
-    }
+        return {
+            "destination_hash": destination_hash.hex(),
+            "source_hash": source_hash.hex(),
+            "signature": signature.hex(),
+            "timestamp": float(timestamp),
+            "title_hex": title_bytes.hex() if isinstance(title_bytes, (bytes, bytearray)) else b"".hex(),
+            "content_hex": content_bytes.hex() if isinstance(content_bytes, (bytes, bytearray)) else b"".hex(),
+            "fields_was_nil": fields_was_nil,
+            "fields_count": len(fields) if hasattr(fields, "__len__") else 0,
+            "stamp": stamp.hex() if isinstance(stamp, (bytes, bytearray)) else None,
+            "message_hash": message_hash.hex(),
+        }
+    except Exception as e:
+        return {"decode_error": f"field extraction: {type(e).__name__}: {e}"}
 
 
 def cmd_lxmf_shutdown(params):
