@@ -273,7 +273,7 @@ def test_decode_5elem_with_fields_and_stamp(single_bridge):
 # becomes a test failure that prompts removing the xfail. Per the
 # `feedback-tight-test-assertions` discipline this is preferable to a plain
 # skip — it keeps the regression net wired up rather than going silent.
-_KOTLIN_TITLE_BYTES_BUG_REASON = (
+_KOTLIN_BYTES_FIDELITY_BUG_REASON = (
     "LXMF-kt round-trips title/content through String (UTF-8 decode + encode), "
     "silently corrupting non-UTF-8 byte sequences. Tracked in "
     "https://github.com/torlando-tech/LXMF-kt/issues/25. "
@@ -281,8 +281,12 @@ _KOTLIN_TITLE_BYTES_BUG_REASON = (
 )
 
 
-def _maybe_xfail_kotlin_title_bytes(request, impl):
+def _maybe_xfail_kotlin_bytes_fidelity(request, impl):
     """If running on kotlin, attach a strict xfail marker that runs the test.
+
+    Shared between the title and content byte-fidelity tests — both fields
+    suffer the same String-round-trip corruption on kotlin (see
+    `_KOTLIN_BYTES_FIDELITY_BUG_REASON`).
 
     Using `request.applymarker(pytest.mark.xfail(strict=True))` rather than
     the runtime `pytest.xfail()` call. The runtime call short-circuits the
@@ -292,7 +296,7 @@ def _maybe_xfail_kotlin_title_bytes(request, impl):
     strict mode promotes to a hard failure, alerting us to delete the xfail.
     """
     if impl == "kotlin":
-        request.applymarker(pytest.mark.xfail(strict=True, reason=_KOTLIN_TITLE_BYTES_BUG_REASON))
+        request.applymarker(pytest.mark.xfail(strict=True, reason=_KOTLIN_BYTES_FIDELITY_BUG_REASON))
 
 
 # Three byte sequences that span the failure space:
@@ -314,7 +318,7 @@ def test_decode_preserves_non_utf8_title_bytes(request, impl, single_bridge, cas
     A decoder that converts to a native string and back via UTF-8 corrupts
     any byte sequence that isn't valid UTF-8.
     """
-    _maybe_xfail_kotlin_title_bytes(request, impl)
+    _maybe_xfail_kotlin_bytes_fidelity(request, impl)
 
     payload = [TIMESTAMP, bad_bytes, CONTENT_BYTES, {}]
     lxmf_bytes, _ = _build_lxmf_bytes(payload)
@@ -345,7 +349,7 @@ def test_decode_preserves_non_utf8_content_bytes(request, impl, single_bridge, c
     decoder that handles title correctly but mishandles content is
     surfaced as the right failure.
     """
-    _maybe_xfail_kotlin_title_bytes(request, impl)
+    _maybe_xfail_kotlin_bytes_fidelity(request, impl)
 
     payload = [TIMESTAMP, TITLE_BYTES, bad_bytes, {}]
     lxmf_bytes, _ = _build_lxmf_bytes(payload)
@@ -359,7 +363,10 @@ def test_decode_preserves_non_utf8_content_bytes(request, impl, single_bridge, c
         f"  actual:   {resp['content_hex']}\n"
         f"Same root cause as the title-bytes case — LXMF content is opaque bytes."
     )
-    assert resp["message_hash"] == expected
+    assert resp["message_hash"] == expected, (
+        f"[{case_name}] hash mismatch — repack must use original content bytes verbatim, "
+        f"not String-round-tripped bytes"
+    )
 
 
 # --------------------------------------------------------------------------- #
