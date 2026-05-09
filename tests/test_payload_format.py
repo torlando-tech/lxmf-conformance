@@ -300,8 +300,9 @@ def _maybe_xfail_kotlin_bytes_fidelity(request, impl):
 
 
 # Three byte sequences that span the failure space:
-#   - high-bit bytes that aren't valid UTF-8 starts (0xff)
-#   - low-bit + null bytes (NUL is valid UTF-8 but a common String boundary)
+#   - high-bit bytes that aren't valid UTF-8 starts (0xff 0xfe)
+#   - null bytes + high-bit mix (NUL is valid UTF-8 but a common String boundary;
+#     0x80/0xff add high-bit corruption on top)
 #   - a partial UTF-8 lead byte with no continuation (0xC3 alone is invalid)
 NON_UTF8_BYTE_CASES = [
     ("ff_fe", bytes.fromhex("fffe")),
