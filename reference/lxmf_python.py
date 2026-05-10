@@ -694,8 +694,10 @@ def cmd_lxmf_send_opportunistic(params):
                 _state._outbound_state[msg.hash] = new_state
                 # Capture the message's final progress value before
                 # the cleanup pop. `cmd_lxmf_get_message_progress`
-                # consults `_outbound_progress` first, so this is the
-                # source of truth after the live reference is dropped.
+                # consults the live LXMessage first, then falls back
+                # to `_outbound_progress` after the live reference is
+                # dropped — this snapshot is the fallback source of
+                # truth once delivery pops the live entry.
                 _record_outbound_progress(
                     msg.hash, float(getattr(msg, "progress", 0.0))
                 )
@@ -808,8 +810,10 @@ def cmd_lxmf_send_direct(params):
                 _state._outbound_state[msg.hash] = new_state
                 # Capture the message's final progress value before
                 # the cleanup pop. `cmd_lxmf_get_message_progress`
-                # consults `_outbound_progress` first, so this is the
-                # source of truth after the live reference is dropped.
+                # consults the live LXMessage first, then falls back
+                # to `_outbound_progress` after the live reference is
+                # dropped — this snapshot is the fallback source of
+                # truth once delivery pops the live entry.
                 _record_outbound_progress(
                     msg.hash, float(getattr(msg, "progress", 0.0))
                 )
@@ -1029,8 +1033,10 @@ def cmd_lxmf_send_propagated(params):
                 _state._outbound_state[msg.hash] = new_state
                 # Capture the message's final progress value before
                 # the cleanup pop. `cmd_lxmf_get_message_progress`
-                # consults `_outbound_progress` first, so this is the
-                # source of truth after the live reference is dropped.
+                # consults the live LXMessage first, then falls back
+                # to `_outbound_progress` after the live reference is
+                # dropped — this snapshot is the fallback source of
+                # truth once delivery pops the live entry.
                 _record_outbound_progress(
                     msg.hash, float(getattr(msg, "progress", 0.0))
                 )
