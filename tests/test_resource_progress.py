@@ -53,10 +53,12 @@ def _drain_progress(server, message_hash, deadline):
         state = server.message_state(message_hash)
         if state in ("delivered", "failed"):
             break
-        # 10 ms poll interval gives ~30+ samples across a 50 KB
-        # loopback Resource transfer (typical ~300 ms on CI),
-        # which is enough margin to land at least one mid-flight
-        # observation before delivery flips state to terminal.
+        # 10 ms poll interval is fine-grained enough that any
+        # impl which fires the progress callback more than once
+        # during a 50 KB loopback transfer will produce multiple
+        # samples here; impls that fire only once (e.g. python's
+        # sender-side RNS.Resource) still satisfy the ≥1-sample
+        # + monotonic + final==1.0 invariants asserted below.
         time.sleep(0.01)
     final_state = server.message_state(message_hash)
     final_progress = server.message_progress(message_hash)
@@ -66,7 +68,7 @@ def _drain_progress(server, message_hash, deadline):
 
 
 def test_resource_progress_ticks_during_transfer(server_impl, client_impl, pipe_pair):
-    """Server -> client large direct message; server observes progress >0 and =1.0."""
+    """Server -> client large direct message; server observes ≥1 progress sample, monotonic, final == 1.0."""
     server, client = pipe_pair
 
     # 50 KB random payload: enough resource-parts to make at least
