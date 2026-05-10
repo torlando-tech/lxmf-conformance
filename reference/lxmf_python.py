@@ -692,15 +692,16 @@ def cmd_lxmf_send_opportunistic(params):
             with _state._outbound_lock:
                 new_state = _state_to_string(msg.state)
                 _state._outbound_state[msg.hash] = new_state
-                # Capture the message's final progress value before
-                # the cleanup pop. `cmd_lxmf_get_message_progress`
-                # consults the live LXMessage first, then falls back
-                # to `_outbound_progress` after the live reference is
-                # dropped — this snapshot is the fallback source of
-                # truth once delivery pops the live entry.
-                _record_outbound_progress(
-                    msg.hash, float(getattr(msg, "progress", 0.0))
-                )
+                # Only snapshot when progress was actually ticked
+                # (> 0.0) so PACKET-path messages (OPPORTUNISTIC, no
+                # Resource transfer) continue to return the -1.0
+                # "untracked" sentinel from cmd_lxmf_get_message_progress
+                # instead of a misleading 0.0. Other state callbacks
+                # (DIRECT/PROPAGATED) snapshot unconditionally because
+                # those paths do tick progress mid-flight.
+                _progress = float(getattr(msg, "progress", 0.0))
+                if _progress > 0.0:
+                    _record_outbound_progress(msg.hash, _progress)
                 # Drop the live-message reference once the state is
                 # terminal-for-bridge — at that point _outbound_state
                 # holds the authoritative value and nothing else needs
