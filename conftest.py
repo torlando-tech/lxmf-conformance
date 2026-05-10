@@ -168,6 +168,13 @@ def pytest_generate_tests(metafunc):
     # python bridge with `router.enable_propagation()`; that path is
     # plumbed but not the production code path and didn't reliably
     # ship messages even for the all-python trio.
+    # Single-impl parametrization for byte-level / decoder-only tests.
+    # Keeps the impl axis consistent with pair tests but only spawns one
+    # bridge — no TCP, no LXMF lifecycle, no pipe_pair fixture.
+    if "impl" in metafunc.fixturenames and "server_impl" not in metafunc.fixturenames:
+        impls = get_active_impls(metafunc.config)
+        metafunc.parametrize("impl", impls, ids=impls, scope="function")
+
     if "sender_impl" in metafunc.fixturenames and "receiver_impl" in metafunc.fixturenames:
         impls = get_active_impls(metafunc.config)
         pairs = [(s, r) for s in impls for r in impls]
@@ -199,6 +206,25 @@ def sender_impl(request):
 def receiver_impl(request):
     """Receiver-role impl name in 3-bridge propagation topology."""
     return request.param if hasattr(request, "param") else request.node.callspec.params["receiver_impl"]
+
+
+@pytest.fixture
+def single_bridge(impl):
+    """Single LXMF bridge for byte-level / decoder-only tests.
+
+    Use for tests that exercise the bridge's parsing / hashing surface
+    in isolation — no LXMF lifecycle, no TCP, no second bridge. Yields
+    a started ``BridgeClient`` and tears it down on test exit.
+    """
+    cmd = resolve_bridge_command(impl)
+    bridge = BridgeClient(cmd, env=_env_for_impl(impl))
+    try:
+        yield bridge
+    finally:
+        try:
+            bridge.close()
+        except Exception:
+            pass
 
 
 @pytest.fixture
