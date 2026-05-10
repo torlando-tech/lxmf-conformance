@@ -71,8 +71,9 @@ def test_resource_progress_ticks_during_transfer(server_impl, client_impl, pipe_
     """Server -> client large direct message; server observes ≥1 progress sample, monotonic, final == 1.0."""
     server, client = pipe_pair
 
-    # 50 KB random payload: enough resource-parts to make at least
-    # one mid-flight progress observation likely on loopback.
+    # 50 KB random payload: large enough to force Resource transfer
+    # (exceeds LINK_PACKET_MAX_CONTENT ~319 B), small enough to keep
+    # the test bounded.
     content = "P" * 50000 + secrets.token_hex(16)
     title = f"progress-{secrets.token_hex(4)}"
 
