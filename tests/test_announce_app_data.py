@@ -26,11 +26,11 @@ v0.5+ msgpack array marker (``0x90``-``0x9f`` or ``0xdc``) and decodes
 into a peer_data list whose first element is the announced display
 name as UTF-8 bytes — NOT random ratchet bytes.
 
-The test is gated to ``client_impl == 'microlxmf'`` because the
-``lxmf_recall_app_data`` bridge command (added in microLXMF
-conformance-bridge for this regression) is microlxmf-only. The
-sender side stays parametrized so the same invariant gets exercised
-across whichever impls produce ratchet announces.
+``lxmf_recall_app_data`` is implemented on both python and microlxmf
+bridges, so the test runs across the full sender × receiver matrix.
+The trivial python→python pair self-confirms python's reference
+behavior; the interesting cross-impl pair is microlxmf→python, which
+asserts python correctly parses whatever microLXMF emits on the wire.
 """
 
 import time
@@ -50,12 +50,6 @@ def _hex_first_byte(hex_str):
 
 
 def test_announce_app_data_strips_ratchet(server_impl, client_impl, pipe_pair):
-    if client_impl != "microlxmf":
-        pytest.skip(
-            "lxmf_recall_app_data is microlxmf-only; this test pins the "
-            "microReticulum announce-parser ratchet handling."
-        )
-
     server, client = pipe_pair
 
     # Re-announce both sides in case the fixture's startup window

@@ -830,6 +830,29 @@ def cmd_lxmf_has_path(params):
     }
 
 
+def cmd_lxmf_recall_app_data(params):
+    """Return raw app_data bytes (hex) most recently learned for ``destination_hash``.
+
+    Mirrors microLXMF's ``lxmf_recall_app_data`` so the ratchet-strip
+    invariant in ``test_announce_app_data`` runs across the full
+    sender × receiver matrix instead of skipping when the receiver
+    is python. The trivial python→python pair is self-confirmation;
+    the interesting one is microlxmf→python — it asserts python
+    correctly parses whatever microLXMF emits on the wire.
+
+    Returns ``{"size": N, "hex": "..."}``. Empty string when RNS has
+    no recorded app_data for the destination (the test asserts
+    ``size > 0`` and surfaces convergence failure that way).
+    """
+    if _state.router is None:
+        raise RuntimeError("lxmf_init must be called before lxmf_recall_app_data")
+    dest_hash = bytes.fromhex(params["destination_hash"])
+    app_data = RNS.Identity.recall_app_data(dest_hash)
+    if app_data is None:
+        return {"size": 0, "hex": ""}
+    return {"size": len(app_data), "hex": app_data.hex()}
+
+
 def cmd_lxmf_request_path(params):
     """Solicit an announce for ``destination_hash`` via Reticulum's path-request flow.
 
@@ -1244,6 +1267,7 @@ COMMANDS = {
     "lxmf_send_opportunistic": cmd_lxmf_send_opportunistic,
     "lxmf_send_direct": cmd_lxmf_send_direct,
     "lxmf_has_path": cmd_lxmf_has_path,
+    "lxmf_recall_app_data": cmd_lxmf_recall_app_data,
     "lxmf_request_path": cmd_lxmf_request_path,
     "lxmf_set_outbound_propagation_node": cmd_lxmf_set_outbound_propagation_node,
     "lxmf_send_propagated": cmd_lxmf_send_propagated,
