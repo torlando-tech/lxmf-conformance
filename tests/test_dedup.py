@@ -119,14 +119,27 @@ def test_duplicate_message_hash_arrives_once_in_inbox(server_impl, client_impl, 
     )
 
     # ---- Wait and verify NO duplicate ---------------------------------
-    # Linger >= one poll cycle so a delayed duplicate has a chance to
-    # land. Per the tight-assertions discipline (memory note
-    # `feedback-tight-test-assertions`), we need to actively look for
-    # the bug — short timeouts mask real duplicates.
-    time.sleep(2.0)
-    final = list(received)  # snapshot what we have so far
-    final += client.drain_received()
+    # Active polling with the SAME 15s deadline used for first-arrival,
+    # not a flat short sleep. A flat window shorter than the first-arrival
+    # deadline risks false negatives on slow impls/networks: if per-message
+    # latency is 3-5s, a flat 2s linger could close before a delayed
+    # duplicate landed and `len(matching) == 1` would pass spuriously,
+    # silently masking a broken dedup. Per the tight-assertions discipline
+    # (memory note `feedback-tight-test-assertions`), we actively look for
+    # the bug — break early when a duplicate appears (test fails fast on
+    # broken dedup) and only wait the full window when the impl is
+    # behaving correctly.
+    final = list(received)  # start from what we already drained
     matching = [m for m in final if m["message_hash"] == first_hash.hex()]
+    dup_deadline = time.time() + 15.0
+    while time.time() < dup_deadline:
+        new_msgs = client.drain_received()
+        if new_msgs:
+            final += new_msgs
+            matching = [m for m in final if m["message_hash"] == first_hash.hex()]
+            if len(matching) > 1:
+                break  # duplicate already arrived → fail fast
+        time.sleep(0.2)
 
     assert len(matching) == 1, (
         f"Receiver ({client_impl}) delivered {len(matching)} inbox entries for the "
