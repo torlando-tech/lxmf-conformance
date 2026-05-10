@@ -157,9 +157,9 @@ def test_pinned_timestamp_produces_deterministic_message_hash(server_impl, pipe_
     inputs → identical hash) actually works on the sender impl.
 
     A separate test from the dedup one so that if the sender's pack() is
-    non-deterministic, this test fails first with a clear "your impl's
-    pack is non-deterministic" message — rather than the dedup test
-    failing for the wrong reason.
+    non-deterministic, both this test and the dedup test's inline sanity
+    assertion will fail with a clear "your impl's pack is non-deterministic"
+    message — rather than the dedup test failing for the wrong reason.
     """
     server, _ = pipe_pair
 
