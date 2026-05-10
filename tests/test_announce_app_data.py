@@ -33,14 +33,24 @@ behavior; the interesting cross-impl pair is microlxmf→python, which
 asserts python correctly parses whatever microLXMF emits on the wire.
 """
 
+import os
+import sys
 import time
 
 import pytest
 
-# Use whichever RNS is importable in the pytest process — pip-installed
-# (transitively via LXMF) or already on sys.path. We only need
-# umsgpack for app_data decoding; no path forcing required.
-import RNS.vendor.umsgpack as msgpack
+# Match conftest.py's PYTHON_RNS_PATH resolution so this test sees the
+# same in-tree RNS the rest of the conformance suite uses. CI checks
+# out RNS into the workspace and exports PYTHON_RNS_PATH; locally we
+# fall back to ~/repos/Reticulum. Without this, importing RNS in the
+# pytest process raises ModuleNotFoundError on CI (RNS isn't pip-
+# installed in the runner image) — see the test-collection failure
+# that surfaced this gap.
+sys.path.insert(
+    0,
+    os.environ.get("PYTHON_RNS_PATH", os.path.expanduser("~/repos/Reticulum")),
+)
+import RNS.vendor.umsgpack as msgpack  # noqa: E402
 
 
 def _hex_first_byte(hex_str):
@@ -50,6 +60,21 @@ def _hex_first_byte(hex_str):
 
 
 def test_announce_app_data_strips_ratchet(server_impl, client_impl, pipe_pair):
+    # ``lxmf_recall_app_data`` is currently implemented only on the
+    # python and microlxmf bridges (the test docstring above states
+    # this explicitly). Swift's bridge has no such command and kotlin
+    # is a Phase-2 placeholder — both would surface as a
+    # ``BridgeError("unknown command")`` rather than a clean skip when
+    # they appear in the parametrized matrix. Skip non-recall-capable
+    # client impls up front so the matrix stays loud about real
+    # regressions instead of impl-coverage gaps.
+    if client_impl not in ("python", "microlxmf"):
+        pytest.skip(
+            f"client impl {client_impl!r} does not implement "
+            f"lxmf_recall_app_data; recall-capable impls are "
+            f"python and microlxmf"
+        )
+
     server, client = pipe_pair
 
     # Re-announce both sides in case the fixture's startup window
