@@ -830,6 +830,24 @@ def cmd_lxmf_has_path(params):
     }
 
 
+def cmd_lxmf_get_message_progress(params):
+    """Return the resource-transfer progress for ``message_hash`` in [0.0, 1.0].
+
+    Mirrors microLXMF's ``lxmf_get_message_progress``, which mirrors
+    python LXMF's public ``LXMessage.progress`` field. Returns -1.0
+    when no progress has been recorded — typically because the message
+    used the PACKET path (small payload, no resource transfer) and
+    therefore never ticks progress mid-flight.
+    """
+    if _state.router is None:
+        raise RuntimeError("lxmf_init must be called before lxmf_get_message_progress")
+    msg_hash = bytes.fromhex(params["message_hash"])
+    msg = _state._outbound_messages.get(msg_hash)
+    if msg is None:
+        return {"progress": -1.0}
+    return {"progress": float(getattr(msg, "progress", 0.0))}
+
+
 def cmd_lxmf_recall_app_data(params):
     """Return raw app_data bytes (hex) most recently learned for ``destination_hash``.
 
@@ -1267,6 +1285,7 @@ COMMANDS = {
     "lxmf_send_opportunistic": cmd_lxmf_send_opportunistic,
     "lxmf_send_direct": cmd_lxmf_send_direct,
     "lxmf_has_path": cmd_lxmf_has_path,
+    "lxmf_get_message_progress": cmd_lxmf_get_message_progress,
     "lxmf_recall_app_data": cmd_lxmf_recall_app_data,
     "lxmf_request_path": cmd_lxmf_request_path,
     "lxmf_set_outbound_propagation_node": cmd_lxmf_set_outbound_propagation_node,
