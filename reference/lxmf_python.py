@@ -173,10 +173,42 @@ class _BridgeState:
         # even after the message has actually advanced.
         self._outbound_messages: dict[bytes, "LXMF.LXMessage"] = {}
 
+        # Outbound progress snapshot. Keyed by message hash → last
+        # observed `LXMessage.progress` (float in [0.0, 1.0]). Captured
+        # in the per-message state callback so the value survives the
+        # `_outbound_messages.pop(...)` cleanup that fires on terminal
+        # state. Without this, `cmd_lxmf_get_message_progress` returned
+        # -1.0 once the message was delivered, racing the test's final-
+        # value assertion against the pop.
+        self._outbound_progress: dict[bytes, float] = {}
+
         self._interfaces: list[FdPipeInterface] = []
 
 
 _state = _BridgeState()
+
+
+# Cap on `_outbound_progress` to prevent unbounded growth in long-running
+# bridge processes. The dict is keyed by message hash and is only consulted
+# AFTER `_outbound_messages.pop(...)` drops the live reference on terminal
+# state — i.e. it's a small post-mortem snapshot, not a live lookup table.
+# Tests don't typically send more than a few hundred messages per session,
+# so 1024 is comfortable headroom; long-running production bridges get
+# bounded memory at the cost of "very old" deliveries reporting -1.0
+# instead of their true terminal progress (callers should query promptly
+# after delivery, which they already do).
+_OUTBOUND_PROGRESS_MAX = 1024
+
+
+def _record_outbound_progress(msg_hash: bytes, progress: float) -> None:
+    """Record a terminal progress snapshot, FIFO-evicting older entries
+    once `_OUTBOUND_PROGRESS_MAX` is exceeded. Caller MUST hold
+    `_state._outbound_lock` — the helper does no locking of its own."""
+    _state._outbound_progress[msg_hash] = progress
+    while len(_state._outbound_progress) > _OUTBOUND_PROGRESS_MAX:
+        # dict iteration is insertion-order in py3.7+; popping the first
+        # key gives FIFO eviction without an OrderedDict dependency.
+        _state._outbound_progress.pop(next(iter(_state._outbound_progress)))
 
 
 # --------------------------------------------------------------------------- #
@@ -666,6 +698,16 @@ def cmd_lxmf_send_opportunistic(params):
             with _state._outbound_lock:
                 new_state = _state_to_string(msg.state)
                 _state._outbound_state[msg.hash] = new_state
+                # Only snapshot when progress was actually ticked
+                # (> 0.0) so PACKET-path messages (OPPORTUNISTIC, no
+                # Resource transfer) continue to return the -1.0
+                # "untracked" sentinel from cmd_lxmf_get_message_progress
+                # instead of a misleading 0.0. Other state callbacks
+                # (DIRECT/PROPAGATED) snapshot unconditionally because
+                # those paths do tick progress mid-flight.
+                _progress = float(getattr(msg, "progress", 0.0))
+                if _progress > 0.0:
+                    _record_outbound_progress(msg.hash, _progress)
                 # Drop the live-message reference once the state is
                 # terminal-for-bridge — at that point _outbound_state
                 # holds the authoritative value and nothing else needs
@@ -780,6 +822,15 @@ def cmd_lxmf_send_direct(params):
             with _state._outbound_lock:
                 new_state = _state_to_string(msg.state)
                 _state._outbound_state[msg.hash] = new_state
+                # Capture the message's final progress value before
+                # the cleanup pop. `cmd_lxmf_get_message_progress`
+                # consults the live LXMessage first, then falls back
+                # to `_outbound_progress` after the live reference is
+                # dropped — this snapshot is the fallback source of
+                # truth once delivery pops the live entry.
+                _record_outbound_progress(
+                    msg.hash, float(getattr(msg, "progress", 0.0))
+                )
                 # Drop the live-message reference once the state is
                 # terminal-for-bridge — at that point _outbound_state
                 # holds the authoritative value and nothing else needs
@@ -841,6 +892,38 @@ def cmd_lxmf_has_path(params):
         "transport_has_path": has_path,
         "identity_recalled": has_identity,
     }
+
+
+def cmd_lxmf_get_message_progress(params):
+    """Return the resource-transfer progress for ``message_hash`` in [0.0, 1.0].
+
+    Mirrors microLXMF's ``lxmf_get_message_progress``, which mirrors
+    python LXMF's public ``LXMessage.progress`` field. Returns -1.0
+    when no progress has been recorded — typically because the message
+    used the PACKET path (small payload, no resource transfer) and
+    therefore never ticks progress mid-flight.
+
+    Resolution order:
+
+      1. Live LXMessage in `_outbound_messages` — authoritative while
+         the message is in flight.
+      2. Captured snapshot in `_outbound_progress` — populated by the
+         state callback right before the live reference is popped on
+         terminal state. This survives delivery so polling tests can
+         still observe the final 1.0 value after `state == 'delivered'`.
+      3. -1.0 sentinel — no progress observed for this hash.
+    """
+    if _state.router is None:
+        raise RuntimeError("lxmf_init must be called before lxmf_get_message_progress")
+    msg_hash = bytes.fromhex(params["message_hash"])
+    with _state._outbound_lock:
+        msg = _state._outbound_messages.get(msg_hash)
+        if msg is not None:
+            return {"progress": float(getattr(msg, "progress", 0.0))}
+        snapshot = _state._outbound_progress.get(msg_hash)
+        if snapshot is not None:
+            return {"progress": float(snapshot)}
+    return {"progress": -1.0}
 
 
 def cmd_lxmf_recall_app_data(params):
@@ -962,6 +1045,15 @@ def cmd_lxmf_send_propagated(params):
             with _state._outbound_lock:
                 new_state = _state_to_string(msg.state)
                 _state._outbound_state[msg.hash] = new_state
+                # Capture the message's final progress value before
+                # the cleanup pop. `cmd_lxmf_get_message_progress`
+                # consults the live LXMessage first, then falls back
+                # to `_outbound_progress` after the live reference is
+                # dropped — this snapshot is the fallback source of
+                # truth once delivery pops the live entry.
+                _record_outbound_progress(
+                    msg.hash, float(getattr(msg, "progress", 0.0))
+                )
                 # Drop the live-message reference once the state is
                 # terminal-for-bridge — at that point _outbound_state
                 # holds the authoritative value and nothing else needs
@@ -1297,6 +1389,7 @@ def cmd_lxmf_shutdown(params):
     with _state._outbound_lock:
         _state._outbound_state.clear()
         _state._outbound_messages.clear()
+        _state._outbound_progress.clear()
 
     return {"stopped": stopped}
 
@@ -1390,6 +1483,7 @@ COMMANDS = {
     "lxmf_send_opportunistic": cmd_lxmf_send_opportunistic,
     "lxmf_send_direct": cmd_lxmf_send_direct,
     "lxmf_has_path": cmd_lxmf_has_path,
+    "lxmf_get_message_progress": cmd_lxmf_get_message_progress,
     "lxmf_recall_app_data": cmd_lxmf_recall_app_data,
     "lxmf_request_path": cmd_lxmf_request_path,
     "lxmf_set_outbound_propagation_node": cmd_lxmf_set_outbound_propagation_node,

@@ -717,3 +717,15 @@ class _BridgeNode:
             "lxmf_get_message_state", message_hash=message_hash.hex()
         )
         return result["state"]
+
+    def message_progress(self, message_hash):
+        """Return resource-transfer progress in [0.0, 1.0], or -1.0 if untracked.
+
+        Untracked = bridge has no progress entry for this hash, e.g.
+        small messages that took the PACKET path (no Resource → no
+        progress ticks). Wraps `lxmf_get_message_progress`.
+        """
+        result = self.bridge.execute(
+            "lxmf_get_message_progress", message_hash=message_hash.hex()
+        )
+        return float(result["progress"])
