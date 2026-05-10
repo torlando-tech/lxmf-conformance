@@ -188,6 +188,29 @@ class _BridgeState:
 _state = _BridgeState()
 
 
+# Cap on `_outbound_progress` to prevent unbounded growth in long-running
+# bridge processes. The dict is keyed by message hash and is only consulted
+# AFTER `_outbound_messages.pop(...)` drops the live reference on terminal
+# state — i.e. it's a small post-mortem snapshot, not a live lookup table.
+# Tests don't typically send more than a few hundred messages per session,
+# so 1024 is comfortable headroom; long-running production bridges get
+# bounded memory at the cost of "very old" deliveries reporting -1.0
+# instead of their true terminal progress (callers should query promptly
+# after delivery, which they already do).
+_OUTBOUND_PROGRESS_MAX = 1024
+
+
+def _record_outbound_progress(msg_hash: bytes, progress: float) -> None:
+    """Record a terminal progress snapshot, FIFO-evicting older entries
+    once `_OUTBOUND_PROGRESS_MAX` is exceeded. Caller MUST hold
+    `_state._outbound_lock` — the helper does no locking of its own."""
+    _state._outbound_progress[msg_hash] = progress
+    while len(_state._outbound_progress) > _OUTBOUND_PROGRESS_MAX:
+        # dict iteration is insertion-order in py3.7+; popping the first
+        # key gives FIFO eviction without an OrderedDict dependency.
+        _state._outbound_progress.pop(next(iter(_state._outbound_progress)))
+
+
 # --------------------------------------------------------------------------- #
 # LXMF field encoding / decoding
 # --------------------------------------------------------------------------- #
@@ -673,8 +696,8 @@ def cmd_lxmf_send_opportunistic(params):
                 # the cleanup pop. `cmd_lxmf_get_message_progress`
                 # consults `_outbound_progress` first, so this is the
                 # source of truth after the live reference is dropped.
-                _state._outbound_progress[msg.hash] = float(
-                    getattr(msg, "progress", 0.0)
+                _record_outbound_progress(
+                    msg.hash, float(getattr(msg, "progress", 0.0))
                 )
                 # Drop the live-message reference once the state is
                 # terminal-for-bridge — at that point _outbound_state
@@ -787,8 +810,8 @@ def cmd_lxmf_send_direct(params):
                 # the cleanup pop. `cmd_lxmf_get_message_progress`
                 # consults `_outbound_progress` first, so this is the
                 # source of truth after the live reference is dropped.
-                _state._outbound_progress[msg.hash] = float(
-                    getattr(msg, "progress", 0.0)
+                _record_outbound_progress(
+                    msg.hash, float(getattr(msg, "progress", 0.0))
                 )
                 # Drop the live-message reference once the state is
                 # terminal-for-bridge — at that point _outbound_state
@@ -1008,8 +1031,8 @@ def cmd_lxmf_send_propagated(params):
                 # the cleanup pop. `cmd_lxmf_get_message_progress`
                 # consults `_outbound_progress` first, so this is the
                 # source of truth after the live reference is dropped.
-                _state._outbound_progress[msg.hash] = float(
-                    getattr(msg, "progress", 0.0)
+                _record_outbound_progress(
+                    msg.hash, float(getattr(msg, "progress", 0.0))
                 )
                 # Drop the live-message reference once the state is
                 # terminal-for-bridge — at that point _outbound_state

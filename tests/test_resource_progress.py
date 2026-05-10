@@ -82,7 +82,7 @@ def test_resource_progress_ticks_during_transfer(server_impl, client_impl, pipe_
     )
 
     # 30s ceiling — well above expected loopback transfer time but
-    # generous enough to absorb CI scheduling jitter. The 20 ms poll
+    # generous enough to absorb CI scheduling jitter. The 10 ms poll
     # interval inside _drain_progress keeps sampling fine-grained
     # enough to catch intermediate ticks.
     deadline = time.time() + 30.0
