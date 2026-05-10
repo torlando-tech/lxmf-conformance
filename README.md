@@ -80,6 +80,7 @@ Each entry in `lxmf_get_received_messages.result.messages`:
 | python | shipping | `reference/lxmf_python.py` |
 | swift | shipping | [LXMF-swift] `Sources/LXMFConformanceBridge/main.swift` |
 | kotlin | stub only | `reference/lxmf_kotlin.kt` (Phase 2) |
+| microlxmf | skeleton (Phase 0) | [microLXMF] `conformance-bridge/` (CMake) |
 
 ## Running locally
 
