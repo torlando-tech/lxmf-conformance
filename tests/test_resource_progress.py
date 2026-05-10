@@ -50,7 +50,11 @@ def _drain_progress(server, message_hash, deadline):
         state = server.message_state(message_hash)
         if state in ("delivered", "failed"):
             break
-        time.sleep(0.02)
+        # 10 ms poll interval gives ~30+ samples across a 50 KB
+        # loopback Resource transfer (typical ~300 ms on CI),
+        # which is enough margin to land at least one mid-flight
+        # observation before delivery flips state to terminal.
+        time.sleep(0.01)
     final_state = server.message_state(message_hash)
     final_progress = server.message_progress(message_hash)
     if final_progress >= 0.0:
@@ -94,6 +98,25 @@ def test_resource_progress_ticks_during_transfer(server_impl, client_impl, pipe_
         f"server ({server_impl}) recorded zero progress samples for "
         f"a 50 KB Resource transfer to ({client_impl}) — likely the "
         f"progress_callback is not wired. Final state: {final_state!r}"
+    )
+
+    # Require at least one strictly-mid-flight sample (0 < s < 1).
+    # On the python side `_outbound_progress` is populated by the
+    # state callback at delivery, so a fast loopback transfer that
+    # finishes before the first poll iteration would produce
+    # samples=[1.0] (snapshot only) and pass the prior assertions
+    # vacuously — even if the resource progress_callback never
+    # fired. This explicit mid-flight check makes the intent
+    # observable: at least one tick must come from the resource
+    # progress hook running while the transfer was still in flight.
+    mid_samples = [s for s in samples if 0.0 < s < 1.0 - 1e-6]
+    assert len(mid_samples) >= 1, (
+        f"server ({server_impl}) recorded no in-flight progress samples "
+        f"for a 50 KB Resource transfer to ({client_impl}). All samples "
+        f"were either 0.0 or final 1.0 — the resource progress_callback "
+        f"may not be wired (or the snapshot fallback gave 1.0 on "
+        f"terminal state regardless of whether the progress hook ticked). "
+        f"Samples: {samples}"
     )
 
     for i in range(1, len(samples)):
