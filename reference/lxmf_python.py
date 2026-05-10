@@ -127,6 +127,50 @@ else:
     _LXStamper.generate_stamp = _generate_stamp_single_process
 
 # --------------------------------------------------------------------------- #
+# Progress tick counter — monkey-patches LXMessage's per-tick progress
+# callback so we can count how many times it fires for each message.
+# `cmd_lxmf_get_message_progress_tick_count` reads this map.
+#
+# Exists alongside the polling-based `lxmf_get_message_progress` because
+# polling races the worker thread on fast loopback transfers — a
+# microLXMF C++ bridge can complete a 50 KB Resource transfer in <10 ms,
+# faster than any reasonable poll interval, leaving a polling-only test
+# unable to distinguish "callback fired many times" from "callback fired
+# once at the end". Counting per-firing in the bridge state captures
+# every tick deterministically regardless of poll timing.
+#
+# Implementation: class-level monkey-patch of `LXMF.LXMessage`'s name-
+# mangled `_LXMessage__update_transfer_progress`. The original method
+# is what python LXMF passes as `progress_callback` to RNS.Resource at
+# `LXMF/LXMessage.py:649,651` — wrapping it once at module import time
+# means every LXMessage instance counts ticks without per-instance setup.
+# --------------------------------------------------------------------------- #
+_progress_tick_counts: dict[bytes, int] = {}
+_progress_tick_counts_lock = threading.Lock()
+_PROGRESS_TICK_COUNTS_MAX = 1024  # mirrors `_OUTBOUND_PROGRESS_MAX`
+
+
+def _record_progress_tick(msg_hash: bytes) -> None:
+    """Increment per-firing counter for `msg_hash`, with FIFO eviction."""
+    with _progress_tick_counts_lock:
+        _progress_tick_counts[msg_hash] = _progress_tick_counts.get(msg_hash, 0) + 1
+        while len(_progress_tick_counts) > _PROGRESS_TICK_COUNTS_MAX:
+            _progress_tick_counts.pop(next(iter(_progress_tick_counts)))
+
+
+_orig_update_transfer_progress = LXMF.LXMessage._LXMessage__update_transfer_progress
+
+
+def _counting_update_transfer_progress(self, resource):
+    _orig_update_transfer_progress(self, resource)
+    msg_hash = getattr(self, "hash", None)
+    if msg_hash:
+        _record_progress_tick(msg_hash)
+
+
+LXMF.LXMessage._LXMessage__update_transfer_progress = _counting_update_transfer_progress
+
+# --------------------------------------------------------------------------- #
 # Bridge state
 # --------------------------------------------------------------------------- #
 
@@ -926,6 +970,26 @@ def cmd_lxmf_get_message_progress(params):
     return {"progress": -1.0}
 
 
+def cmd_lxmf_get_message_progress_tick_count(params):
+    """Return how many times the resource progress_callback fired for ``message_hash``.
+
+    Mirrors microLXMF's ``lxmf_get_message_progress_tick_count``.
+    Conformance tests assert this is >= 2 to prove the callback wires
+    up correctly without depending on poll timing — on fast loopback
+    transfers the worker thread can complete the entire payload before
+    a 10 ms poll observes any intermediate progress value, but every
+    per-part callback firing still increments the counter.
+
+    Returns 0 when no ticks have been recorded — typically because the
+    message used the PACKET path (no Resource → no progress ticks).
+    """
+    if _state.router is None:
+        raise RuntimeError("lxmf_init must be called before lxmf_get_message_progress_tick_count")
+    msg_hash = bytes.fromhex(params["message_hash"])
+    with _progress_tick_counts_lock:
+        return {"count": int(_progress_tick_counts.get(msg_hash, 0))}
+
+
 def cmd_lxmf_recall_app_data(params):
     """Return raw app_data bytes (hex) most recently learned for ``destination_hash``.
 
@@ -1390,6 +1454,8 @@ def cmd_lxmf_shutdown(params):
         _state._outbound_state.clear()
         _state._outbound_messages.clear()
         _state._outbound_progress.clear()
+    with _progress_tick_counts_lock:
+        _progress_tick_counts.clear()
 
     return {"stopped": stopped}
 
@@ -1484,6 +1550,7 @@ COMMANDS = {
     "lxmf_send_direct": cmd_lxmf_send_direct,
     "lxmf_has_path": cmd_lxmf_has_path,
     "lxmf_get_message_progress": cmd_lxmf_get_message_progress,
+    "lxmf_get_message_progress_tick_count": cmd_lxmf_get_message_progress_tick_count,
     "lxmf_recall_app_data": cmd_lxmf_recall_app_data,
     "lxmf_request_path": cmd_lxmf_request_path,
     "lxmf_set_outbound_propagation_node": cmd_lxmf_set_outbound_propagation_node,

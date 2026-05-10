@@ -729,3 +729,19 @@ class _BridgeNode:
             "lxmf_get_message_progress", message_hash=message_hash.hex()
         )
         return float(result["progress"])
+
+    def message_progress_tick_count(self, message_hash):
+        """Return how many times the resource progress_callback fired for this message.
+
+        Lets tests assert "callback fires repeatedly during transfer"
+        without depending on poll timing — on fast loopback transfers
+        the worker thread may complete the entire payload before any
+        polling iteration observes an intermediate value, but every
+        per-part callback firing still increments this counter.
+        Wraps `lxmf_get_message_progress_tick_count`. Returns 0 when
+        no ticks have been recorded.
+        """
+        result = self.bridge.execute(
+            "lxmf_get_message_progress_tick_count", message_hash=message_hash.hex()
+        )
+        return int(result["count"])

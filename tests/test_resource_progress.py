@@ -100,23 +100,21 @@ def test_resource_progress_ticks_during_transfer(server_impl, client_impl, pipe_
         f"progress_callback is not wired. Final state: {final_state!r}"
     )
 
-    # Require at least one strictly-mid-flight sample (0 < s < 1).
-    # On the python side `_outbound_progress` is populated by the
-    # state callback at delivery, so a fast loopback transfer that
-    # finishes before the first poll iteration would produce
-    # samples=[1.0] (snapshot only) and pass the prior assertions
-    # vacuously — even if the resource progress_callback never
-    # fired. This explicit mid-flight check makes the intent
-    # observable: at least one tick must come from the resource
-    # progress hook running while the transfer was still in flight.
-    mid_samples = [s for s in samples if 0.0 < s < 1.0 - 1e-6]
-    assert len(mid_samples) >= 1, (
-        f"server ({server_impl}) recorded no in-flight progress samples "
-        f"for a 50 KB Resource transfer to ({client_impl}). All samples "
-        f"were either 0.0 or final 1.0 — the resource progress_callback "
-        f"may not be wired (or the snapshot fallback gave 1.0 on "
-        f"terminal state regardless of whether the progress hook ticked). "
-        f"Samples: {samples}"
+    # Prove the resource progress_callback fires multiple times during
+    # transfer. Polling the message_progress value is racy — on fast
+    # loopback (e.g. the C++ microLXMF bridge transferring 50 KB in
+    # <10 ms) the worker thread can complete every part-send before any
+    # polling iteration observes an intermediate value, so `samples`
+    # collapses to [1.0, 1.0]. The bridge-side tick counter records
+    # every callback firing deterministically, regardless of polling.
+    tick_count = server.message_progress_tick_count(message_hash)
+    assert tick_count >= 2, (
+        f"server ({server_impl}) progress callback fired {tick_count} "
+        f"time(s) during a 50 KB Resource transfer to ({client_impl}); "
+        f"expected >= 2 (per-part firings). A count <= 1 means either "
+        f"the callback is wired only at the terminal-resource event, "
+        f"or it is not wired at all. Samples observed by polling: "
+        f"{samples}"
     )
 
     for i in range(1, len(samples)):
