@@ -371,9 +371,29 @@ def cmd_lxmf_init(params):
     identity = RNS.Identity()
     router = LXMF.LXMRouter(identity=identity, storagepath=storage_path)
 
+    # Optional inbound stamp enforcement. When `inbound_stamp_cost` is set
+    # (1-254), the bridge mirrors Sideband's `lxmf_require_stamps=True`
+    # config: register the delivery identity with `stamp_cost=N` AND call
+    # `enforce_stamps()`, so inbound messages without a valid PoW stamp
+    # (or matching ticket) are dropped before the delivery callback fires.
+    # Default off — most tests want straight delivery semantics, not the
+    # enforcement side. The cost lands in the announce app_data via
+    # `LXMRouter.get_announce_app_data`, so any sender peer that processes
+    # the announce will auto-configure its outbound stampCost. Tests that
+    # care about the auto-config wiring (e.g. the announce-derived
+    # outbound stamping that LXMF-kt#33 fixed) opt in via this param.
+    inbound_stamp_cost = params.get("inbound_stamp_cost")
+    if inbound_stamp_cost is not None:
+        inbound_stamp_cost = int(inbound_stamp_cost)
+        if not 1 <= inbound_stamp_cost <= 254:
+            raise ValueError(
+                f"inbound_stamp_cost must be in [1,254]; got {inbound_stamp_cost}"
+            )
     delivery_destination = router.register_delivery_identity(
-        identity, display_name=display_name
+        identity, display_name=display_name, stamp_cost=inbound_stamp_cost
     )
+    if inbound_stamp_cost is not None:
+        router.enforce_stamps()
 
     # Hook the delivery callback so inbound messages land in our queue.
     # The hash field on the inbound LXMessage IS the message hash; we
