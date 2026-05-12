@@ -357,6 +357,114 @@ def pipe_pair(server_impl, client_impl):
 
 
 @pytest.fixture
+def pipe_pair_enforce_stamps(server_impl, client_impl):
+    """Like ``pipe_pair`` but the SERVER registers with ``inbound_stamp_cost=4``
+    and ``enforce_stamps()``. Used by tests that pin the
+    receiver-announces-cost → sender-auto-stamps cross-impl contract
+    (e.g. the regression test for LXMF-kt#33, where Kotlin senders
+    emitted unstamped wire bytes because the lxmf.delivery announce
+    handler wasn't registered).
+
+    The receiver-side ``inbound_stamp_cost`` lands in the announce app_data
+    via ``LXMRouter.get_announce_app_data``, so any sender peer that
+    processes the announce should auto-configure its outbound
+    ``stampCost`` and produce a stamped wire. This fixture's contract is:
+    "if the sender impl correctly auto-configures from announces, an
+    inbound message arrives at the server's inbox; otherwise
+    enforce_stamps drops it before delivery_callback fires and the inbox
+    stays empty".
+
+    Currently restricted to ``server_impl == "python"`` because only the
+    python reference bridge supports the ``inbound_stamp_cost`` parameter
+    on ``lxmf_init``. The kotlin / swift / microlxmf bridges accept the
+    arg silently or reject it; until they implement enforce_stamps, the
+    fixture skips non-python servers. When parity lands the skip can come
+    out and the matrix expands automatically.
+
+    Cost = 4 chosen as the smallest cost that produces a meaningful PoW
+    workblock-and-search (cost 1-3 effectively passes any random stamp on
+    the first attempt). Anything higher slows the test to no benefit.
+    """
+    import time
+
+    if server_impl != "python":
+        pytest.skip(
+            f"inbound_stamp_cost not yet supported by '{server_impl}' bridge "
+            "(only python reference). Skipping until bridge parity lands."
+        )
+
+    server_cmd = resolve_bridge_command(server_impl)
+    client_cmd = resolve_bridge_command(client_impl)
+
+    server_bridge = None
+    client_bridge = None
+
+    try:
+        server_bridge = BridgeClient(server_cmd, env=_env_for_impl(server_impl))
+        client_bridge = BridgeClient(client_cmd, env=_env_for_impl(client_impl))
+
+        server_init = server_bridge.execute(
+            "lxmf_init",
+            display_name=f"server-{server_impl}",
+            inbound_stamp_cost=4,
+        )
+        client_init = client_bridge.execute(
+            "lxmf_init", display_name=f"client-{client_impl}"
+        )
+
+        server_iface = server_bridge.execute(
+            "lxmf_add_tcp_server_interface", name="serverlistener"
+        )
+        listener_port = int(server_iface["port"])
+        client_bridge.execute(
+            "lxmf_add_tcp_client_interface",
+            target_host="127.0.0.1",
+            target_port=listener_port,
+            name="clientconnector",
+        )
+        time.sleep(1.5)
+
+        # Server announces FIRST and we wait an extra beat — the test's
+        # whole point is that the client picks up the cost from this
+        # announce before sending. If the announce hasn't propagated yet
+        # the client's outbound auto-config cache miss would yield an
+        # unstamped send for reasons unrelated to the auto-config wiring
+        # (just timing). 1s settles loopback path discovery comfortably.
+        server_bridge.execute("lxmf_announce")
+        time.sleep(1.0)
+        client_bridge.execute("lxmf_announce")
+        time.sleep(3.0)
+
+        server = _BridgeNode(
+            bridge=server_bridge,
+            impl=server_impl,
+            identity_hash=bytes.fromhex(server_init["identity_hash"]),
+            delivery_hash=bytes.fromhex(server_init["delivery_destination_hash"]),
+        )
+        client = _BridgeNode(
+            bridge=client_bridge,
+            impl=client_impl,
+            identity_hash=bytes.fromhex(client_init["identity_hash"]),
+            delivery_hash=bytes.fromhex(client_init["delivery_destination_hash"]),
+        )
+
+        yield server, client
+
+    finally:
+        for bridge in (client_bridge, server_bridge):
+            if bridge is None:
+                continue
+            try:
+                bridge.execute("lxmf_shutdown")
+            except Exception:
+                pass
+            try:
+                bridge.close()
+            except Exception:
+                pass
+
+
+@pytest.fixture
 def tcp_trio(sender_impl, receiver_impl):
     """Sender + receiver bridges talking to a real `lxmd` propagation node.
 
