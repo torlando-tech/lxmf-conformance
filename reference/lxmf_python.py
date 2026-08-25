@@ -1278,13 +1278,24 @@ def cmd_lxmf_generate_peering_stamp(params):
     cost = int(params.get("cost", LXMF.LXMRouter.PEERING_COST))
 
     key_material = bytes.fromhex(material_hex)
-    stamp, value = _LXStamper.generate_stamp(
+    # generate_stamp's second element is platform-dependent: VALUE from
+    # the single-process fallback, but ROUNDS when the
+    # set_external_generator hook (torlando-tech LXMF feature branch,
+    # markqvist/LXMF#38) is active — which is exactly what this bridge
+    # installs at import. Never publish it as value; recompute the true
+    # achieved PoW value explicitly (Greptile conformance#25 finding).
+    stamp, _ = _LXStamper.generate_stamp(
         key_material,
         cost,
         expand_rounds=_LXStamper.WORKBLOCK_EXPAND_ROUNDS_PEERING,
     )
     if stamp is None:
         raise RuntimeError(f"peering stamp generation failed at cost {cost}")
+
+    workblock = _LXStamper.stamp_workblock(
+        key_material, expand_rounds=_LXStamper.WORKBLOCK_EXPAND_ROUNDS_PEERING
+    )
+    value = _LXStamper.stamp_value(workblock, stamp)
 
     return {
         "stamp_hex": stamp.hex(),
