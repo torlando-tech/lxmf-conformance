@@ -50,6 +50,14 @@ JSON-RPC over stdin/stdout, one object per line. Every bridge implementation MUS
 | `lxmf_get_received_messages` | `{ since_seq? }` | `{ messages: [...], last_seq }` |
 | `lxmf_get_message_state` | `{ message_hash }` | `{ state: string }` |
 | `lxmf_shutdown` | `{}` | `{ stopped: bool }` |
+| `lxmf_generate_peering_stamp` | `{ key_material_hex, cost? }` | `{ stamp_hex, value, cost }` |
+| `lxmf_validate_peering_stamp` | `{ peering_id_hex, stamp_hex, cost? }` | `{ valid, value, cost }` |
+
+The peering-stamp pair is byte-level/stateless (no `lxmf_init`) and drives
+each impl's **production** PoW paths — python `LXStamper.generate_stamp` /
+`validate_peering_key` at `WORKBLOCK_EXPAND_ROUNDS_PEERING = 25`, kotlin
+`LXStamper.generateStampWithWorkblock` / `LXStamper.validatePeeringKey`.
+Consumed by `tests/test_peering.py` (issue #18).
 
 > **Phase 1 transport: TCP loopback.** The original design called for a Reticulum `PipeInterface` shared between bridges via OS pipes. Bringing that up reliably across `subprocess.Popen` + macOS `posix_spawn` + RNS interface registration consumed multiple cycles without contributing to the actual interop assertions. TCP loopback gives the same direct-pair semantics with the proven machinery `reticulum-conformance` already uses. Phase 2 will revisit a real `PipeInterface`-backed pair (see [ROADMAP.md](ROADMAP.md)) once the cross-impl test surface has stabilised.
 
