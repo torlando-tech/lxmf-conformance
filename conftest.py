@@ -193,6 +193,24 @@ def pytest_generate_tests(metafunc):
             ("sender_impl", "receiver_impl"), pairs, ids=ids, scope="function"
         )
 
+    # Peering-stamp tests (tests/test_peering.py): every
+    # (generator_impl, validator_impl) pair. Same cross-product shape as
+    # server/client — the generator mints a peering stamp for synthetic
+    # identity material, the validator renders an accept/reject verdict.
+    if (
+        "generator_impl" in metafunc.fixturenames
+        and "validator_impl" in metafunc.fixturenames
+    ):
+        impls = get_active_impls(metafunc.config)
+        pairs = [(g, v) for g in impls for v in impls]
+        ids = [f"{g}-gen->{v}-validate" for g, v in pairs]
+        metafunc.parametrize(
+            ("generator_impl", "validator_impl"),
+            pairs,
+            ids=ids,
+            scope="function",
+        )
+
 
 @pytest.fixture
 def server_impl(request):
@@ -216,6 +234,51 @@ def sender_impl(request):
 def receiver_impl(request):
     """Receiver-role impl name in 3-bridge propagation topology."""
     return request.param if hasattr(request, "param") else request.node.callspec.params["receiver_impl"]
+
+
+@pytest.fixture
+def generator_impl(request):
+    """Generator-role impl name for peering-stamp tests (test_peering.py)."""
+    return request.param if hasattr(request, "param") else request.node.callspec.params["generator_impl"]
+
+
+@pytest.fixture
+def validator_impl(request):
+    """Validator-role impl name for peering-stamp tests (test_peering.py)."""
+    return request.param if hasattr(request, "param") else request.node.callspec.params["validator_impl"]
+
+
+@pytest.fixture
+def gen_bridge(generator_impl):
+    """Bridge that GENERATES a peering stamp under test.
+
+    Stateless byte-level commands only (lxmf_generate_peering_stamp /
+    lxmf_validate_peering_stamp) — no lxmf_init lifecycle needed, same
+    rationale as ``single_bridge``.
+    """
+    cmd = resolve_bridge_command(generator_impl)
+    bridge = BridgeClient(cmd, env=_env_for_impl(generator_impl))
+    try:
+        yield bridge
+    finally:
+        try:
+            bridge.close()
+        except Exception:
+            pass
+
+
+@pytest.fixture
+def val_bridge(validator_impl):
+    """Bridge that VALIDATES the peering stamp under test."""
+    cmd = resolve_bridge_command(validator_impl)
+    bridge = BridgeClient(cmd, env=_env_for_impl(validator_impl))
+    try:
+        yield bridge
+    finally:
+        try:
+            bridge.close()
+        except Exception:
+            pass
 
 
 @pytest.fixture

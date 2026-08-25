@@ -1251,6 +1251,87 @@ def cmd_lxmf_get_message_state(params):
     return {"state": state}
 
 
+def cmd_lxmf_generate_peering_stamp(params):
+    """Generate a PN peering stamp via the PRODUCTION LXStamper path.
+
+    Mirrors ``LXMPeer.py::generate_peering_key`` (line 259) exactly:
+    ``generate_stamp(key_material, cost,
+    expand_rounds=WORKBLOCK_EXPAND_ROUNDS_PEERING)`` — the 25-round
+    low-cost expansion, NOT the default 3000-round message-stamp path.
+
+    Byte-level command; no ``lxmf_init`` required.
+
+    Params:
+      - ``key_material_hex``: the raw key material bytes. In the real
+        handshake this is ``peer_hash + node_hash`` on the generating
+        side; tests pass synthetic material explicitly.
+      - ``cost``: target PoW cost (default 18 = python PEERING_COST).
+
+    Returns:
+      - ``stamp_hex``: the generated stamp bytes.
+      - ``value``: achieved stamp value (leading-zero bits).
+      - ``cost``: echoed target cost.
+    """
+    material_hex = params.get("key_material_hex", "")
+    if not material_hex:
+        raise ValueError("key_material_hex is required")
+    cost = int(params.get("cost", LXMF.LXMRouter.PEERING_COST))
+
+    key_material = bytes.fromhex(material_hex)
+    stamp, value = _LXStamper.generate_stamp(
+        key_material,
+        cost,
+        expand_rounds=_LXStamper.WORKBLOCK_EXPAND_ROUNDS_PEERING,
+    )
+    if stamp is None:
+        raise RuntimeError(f"peering stamp generation failed at cost {cost}")
+
+    return {
+        "stamp_hex": stamp.hex(),
+        "value": int(value),
+        "cost": cost,
+    }
+
+
+def cmd_lxmf_validate_peering_stamp(params):
+    """Validate a PN peering stamp via the PRODUCTION LXStamper path.
+
+    Mirrors the node-side check in ``LXMRouter.py``'s offer-request
+    handler (lines ~2300-2307): workblock over the validation id with
+    25 expansion rounds, then ``validate_peering_key`` against the
+    demanded cost.
+
+    Byte-level command; no ``lxmf_init`` required.
+
+    Params:
+      - ``peering_id_hex``: validation id bytes (node-side real form:
+        ``node_hash + remote_hash``).
+      - ``stamp_hex``: stamp to validate.
+      - ``cost``: target PoW cost.
+
+    Returns:
+      - ``valid``: bool verdict.
+      - ``value``: computed stamp value (diagnostic).
+    """
+    pid_hex = params.get("peering_id_hex", "")
+    stamp_hex = params.get("stamp_hex", "")
+    if not pid_hex or not stamp_hex:
+        raise ValueError("peering_id_hex and stamp_hex are required")
+    cost = int(params.get("cost", LXMF.LXMRouter.PEERING_COST))
+
+    peering_id = bytes.fromhex(pid_hex)
+    stamp = bytes.fromhex(stamp_hex)
+    valid = _LXStamper.validate_peering_key(peering_id, stamp, cost)
+
+    # Diagnostic value (not load-bearing for the verdict).
+    workblock = _LXStamper.stamp_workblock(
+        peering_id, expand_rounds=_LXStamper.WORKBLOCK_EXPAND_ROUNDS_PEERING
+    )
+    value = _LXStamper.stamp_value(workblock, stamp)
+
+    return {"valid": bool(valid), "value": int(value), "cost": cost}
+
+
 def cmd_lxmf_decode_bytes(params):
     """Decode raw LXMF wire bytes and return parsed components + computed hash.
 
@@ -1512,6 +1593,8 @@ COMMANDS = {
     "lxmf_get_received_messages": cmd_lxmf_get_received_messages,
     "lxmf_get_message_state": cmd_lxmf_get_message_state,
     "lxmf_decode_bytes": cmd_lxmf_decode_bytes,
+    "lxmf_generate_peering_stamp": cmd_lxmf_generate_peering_stamp,
+    "lxmf_validate_peering_stamp": cmd_lxmf_validate_peering_stamp,
     "lxmf_shutdown": cmd_lxmf_shutdown,
 }
 
