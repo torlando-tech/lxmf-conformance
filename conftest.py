@@ -751,6 +751,24 @@ class _BridgeNode:
         """Emit an LXMF delivery announce."""
         self.bridge.execute("lxmf_announce")
 
+    def inject_inbound(self, stamp_cost=4, title="inject", content="inject-inbound-test"):
+        """Drive a crafted UNSTAMPED inbound message through this node's
+        production delivery path and report whether it reached the inbox.
+
+        This is the deterministic counterpart to a live peer emitting an
+        unstamped message: it sets this node's own delivery destination's
+        ``stamp_cost`` and feeds raw LXMF bytes (no PoW stamp) through
+        ``lxmf_delivery`` / ``lxmfDelivery``. Mirrors the reference Python
+        contract (enforce_stamps=False -> accept). Returns the bridge's
+        result dict: ``{delivered, message_hash, inbox_count}``.
+        """
+        return self.bridge.execute(
+            "lxmf_inject_inbound",
+            stamp_cost=stamp_cost,
+            title=title,
+            content=content,
+        )
+
     def send_opportunistic(self, recipient_hash, content, title="", fields=None,
                            timestamp=None):
         """Send opportunistic LXMF; returns the message hash.
