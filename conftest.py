@@ -554,27 +554,57 @@ def tcp_trio(sender_impl, receiver_impl):
             "lxmf_request_path", destination_hash=pn_hash.hex()
         )
 
-        deadline = time.time() + 15.0
+        # The single-shot path-request reply is occasionally dropped for
+        # one of the bridges (the note above: it "gets lost in the
+        # announce flood"). A bridge whose reply was dropped only recovers
+        # on RNS's own path-request retransmit, which is governed by
+        # RNS.Transport.PATH_REQUEST_TIMEOUT (15s default) plus reply
+        # latency -- i.e. the dropped side lands at ~20s. The original
+        # 15s convergence deadline was tighter than that cycle, so a
+        # dropped reply deterministically timed out the fixture.
+        #
+        # Fix: re-issue the path request for any side that has not yet
+        # converged, every 2s. RNS.request_path() broadcasts a fresh
+        # request unconditionally (it is NOT subject to the
+        # PATH_REQUEST_MI throttle, which only gates the automatic
+        # transport-loop retransmit), so a fresh reply arrives in ~3s and
+        # the dropped side converges in ~5s instead of waiting the full
+        # 15s retransmit. Re-asks are per-side and stop once that side
+        # has a path. The 25s deadline is headroom over the ~5s expected
+        # convergence (GitHub-hosted runners run ~1.5-2x slower than
+        # local 2-core, and a pathological drop+re-drop is possible).
+        deadline = time.time() + 25.0
         sender_has_path = receiver_has_path = False
+        next_sender_ask = next_receiver_ask = time.time() + 2.0
         while time.time() < deadline:
             if not sender_has_path:
                 r = sender_bridge.execute(
                     "lxmf_has_path", destination_hash=pn_hash.hex()
                 )
                 sender_has_path = bool(r.get("has_path"))
+                if not sender_has_path and time.time() >= next_sender_ask:
+                    sender_bridge.execute(
+                        "lxmf_request_path", destination_hash=pn_hash.hex()
+                    )
+                    next_sender_ask = time.time() + 2.0
             if not receiver_has_path:
                 r = receiver_bridge.execute(
                     "lxmf_has_path", destination_hash=pn_hash.hex()
                 )
                 receiver_has_path = bool(r.get("has_path"))
+                if not receiver_has_path and time.time() >= next_receiver_ask:
+                    receiver_bridge.execute(
+                        "lxmf_request_path", destination_hash=pn_hash.hex()
+                    )
+                    next_receiver_ask = time.time() + 2.0
             if sender_has_path and receiver_has_path:
                 break
-            time.sleep(0.4)
+            time.sleep(0.3)
         if not (sender_has_path and receiver_has_path):
             stderr = lxmd_pn.stderr_tail()[-2000:]
             raise RuntimeError(
                 "tcp_trio: path to lxmd's propagation destination did not "
-                f"converge within 15s (sender={sender_has_path}, "
+                f"converge within 25s (sender={sender_has_path}, "
                 f"receiver={receiver_has_path}). lxmd stderr tail:\n{stderr}"
             )
 

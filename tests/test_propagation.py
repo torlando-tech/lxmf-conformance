@@ -22,8 +22,8 @@ import pytest
 
 
 # Override the 60s global pytest-timeout for propagation. Worst-case
-# budget = ~15s tcp_trio fixture + 120s upload deadline + 1s settle +
-# 3×30s sync_inbound retries + 2×2s noPath backoff + ~15s drain ≈ 245s.
+# budget = ~25s tcp_trio fixture + 120s upload deadline + 1s settle +
+# 3×30s sync_inbound retries + 2×2s noPath backoff + ~15s drain ≈ 255s.
 # 360s leaves visible headroom against the worst case while still
 # catching a real hang.
 @pytest.mark.timeout(360)
