@@ -1414,6 +1414,106 @@ def cmd_lxmf_shutdown(params):
     return {"stopped": stopped}
 
 
+def cmd_lxmf_inject_inbound(params):
+    """Deterministically drive a crafted inbound message through the
+    production delivery path and report whether it reached the inbox.
+
+    Purpose: pin the *inbound stamp-enforcement default* without depending
+    on a live second bridge emitting an unstamped wire message over a real
+    RNS link (which would be slow and non-deterministic). We craft raw LXMF
+    bytes that are structurally valid but UNSTAMPED (no PoW stamp in the
+    payload) and feed them to ``LXMRouter.lxmf_delivery`` -- the exact entry
+    point production calls when a delivery packet/resource arrives.
+
+    The contract under test (see tests/test_stamp_enforcement_default.py):
+
+      * The bridge's own delivery destination is registered with
+        ``stamp_cost = N`` (so inbound messages are *subject* to stamp
+        validation -- ``required_stamp_cost != None`` in lxmf_delivery).
+      * Stamp enforcement is NOT called (``router.enforce_stamps()`` is never
+        invoked), mirroring a Sideband/Columba install that advertises a
+        stamp cost but does not hard-enforce it.
+      * A message with no valid stamp then arrives.
+
+    The reference Python LXMF default is ``enforce_stamps=False``
+    (LXMRouter.py:103), so ``lxmf_delivery`` logs "allowing anyway, since
+    stamp enforcement is disabled" and the message REACHES the delivery
+    callback. Any implementation that drops an invalid-stamp message by
+    default (the LXMF-kt #38 divergence) will not put it in the inbox.
+
+    params:
+        stamp_cost (int, optional): stamp cost to set on the bridge's own
+            delivery destination before injecting. Default 4 (matches the
+            existing announce-stamp-cost tests: low enough to keep PoW fast,
+            high enough to be a real threshold). Must be in [1,254].
+        title (str, optional): title of the injected message.
+        content (str, optional): content of the injected message. A fresh
+            random source hash is used per call, so the message hash is
+            unique and the dedup path can never swallow it.
+
+    Returns:
+        delivered (bool): the return value of ``lxmf_delivery`` (True iff the
+            message passed every gate and reached the delivery callback).
+        message_hash (hex): the hash of the injected message.
+        inbox_count (int): number of inbox entries currently held (so a test
+            can diff before/after).
+    """
+    if _state.router is None or _state.delivery_destination is None:
+        raise RuntimeError(
+            "lxmf_inject_inbound requires lxmf_init to have been called"
+        )
+
+    import RNS
+    import RNS.vendor.umsgpack as _umsgpack
+    import os as _os
+    import time as _time
+
+    stamp_cost = int(params.get("stamp_cost", 4))
+    if not 1 <= stamp_cost <= 254:
+        raise ValueError(f"stamp_cost must be in [1,254]; got {stamp_cost}")
+
+    title = params.get("title", "inject-inbound")
+    content = params.get("content", "inject-inbound-test")
+    title_b = title.encode("utf-8")
+    content_b = content.encode("utf-8")
+
+    # Set the delivery destination's required stamp cost. This is the field
+    # lxmf_delivery reads (delivery_destinations[...].stamp_cost) to decide
+    # whether to validate a stamp at all.
+    _state.delivery_destination.stamp_cost = stamp_cost
+
+    # Assemble raw LXMF bytes: dest(16) + source(16) + signature(64) +
+    # payload. Payload is a 4-element msgpack array (timestamp, title,
+    # content, fields) with NO stamp element, so the message is unstamped.
+    # Source is a fresh random hash (unknown to this router) so signature
+    # validation reports SOURCE_UNKNOWN -- but signature validity is NOT a
+    # delivery gate, only the stamp is.
+    dest_hash = _state.delivery_destination.hash
+    source_hash = _os.urandom(16)
+    signature = b"\x00" * 64
+    payload = _umsgpack.packb([_time.time(), title_b, content_b, {}])
+    lxmf_bytes = dest_hash + source_hash + signature + payload
+
+    delivered = _state.router.lxmf_delivery(lxmf_bytes)
+
+    message_hash = None
+    try:
+        message_hash = RNS.Identity.full_hash(
+            dest_hash + source_hash + payload
+        ).hex()
+    except Exception:
+        message_hash = ""
+
+    with _state._inbox_lock:
+        inbox_count = len(_state._inbox)
+
+    return {
+        "delivered": bool(delivered),
+        "message_hash": message_hash,
+        "inbox_count": inbox_count,
+    }
+
+
 # --------------------------------------------------------------------------- #
 # Helpers
 # --------------------------------------------------------------------------- #
@@ -1512,6 +1612,7 @@ COMMANDS = {
     "lxmf_get_received_messages": cmd_lxmf_get_received_messages,
     "lxmf_get_message_state": cmd_lxmf_get_message_state,
     "lxmf_decode_bytes": cmd_lxmf_decode_bytes,
+    "lxmf_inject_inbound": cmd_lxmf_inject_inbound,
     "lxmf_shutdown": cmd_lxmf_shutdown,
 }
 

@@ -73,6 +73,43 @@ Each entry in `lxmf_get_received_messages.result.messages`:
 
 `seq` is monotonic per bridge process. Pass the highest `seq` seen as the next call's `since_seq` to drain incrementally. `method` is one of `"opportunistic"`, `"direct"`, `"propagated"`. `state` for outbound polling is one of `"generating"`, `"outbound"`, `"sending"`, `"sent"`, `"delivered"`, `"failed"`.
 
+### Optional / test-infrastructure commands
+
+These are not part of the core interop matrix. A bridge that does not
+implement one reports it as an unknown command, and the tests that need it
+skip their cross-impl rows for that bridge (the test probes for the command
+first). Implement them to participate in the corresponding checks.
+
+#### `lxmf_inject_inbound` (optional)
+
+Drives a crafted **unstamped** inbound message through the production
+delivery path and reports whether it reached the inbox. Used by
+`tests/test_stamp_enforcement_default.py` to pin the *inbound stamp-
+enforcement default* without depending on a live second bridge emitting an
+unstamped wire message over a real RNS link.
+
+- **Requires** `lxmf_init` to have run first (the bridge must have a live
+  router and delivery destination).
+- **Inputs:** `stamp_cost` (int, optional, `[1, 254]`, default `4`), `title`
+  (str, optional), `content` (str, optional). A fresh random source hash is
+  used per call so the message hash is unique and the dedup path can never
+  swallow it.
+- **Behavior:** sets the bridge's own delivery destination to advertise
+  `stamp_cost` (so inbound messages are *subject* to stamp validation), does
+  **not** enable stamp enforcement (leaving the implementation's default
+  unchanged), crafts raw LXMF bytes that are structurally valid but carry no
+  PoW stamp, and feeds them to the production delivery entry point
+  (`LXMRouter.lxmf_delivery` in the reference).
+- **Result:** `delivered` (bool, the delivery-path return value - True iff the
+  message reached the delivery callback), `message_hash` (hex), and
+  `inbox_count` (int, current inbox entry count so a test can diff
+  before/after).
+
+The reference Python LXMF default is `enforce_stamps=False`, so the message
+reaches the inbox and `delivered` is `true`. An implementation that drops an
+invalid-stamp message by default will return `delivered: false` with an
+unchanged `inbox_count` - exactly the divergence the test captures.
+
 ## Implementations
 
 | Impl | Status | Bridge location |
