@@ -101,7 +101,20 @@ def test_opportunistic_message_with_ack(server_impl, client_impl, pipe_pair):
     # to DELIVERED. This is the cross-impl interop proof for the
     # opportunistic path: receiver decoded correctly AND sender
     # processed the proof correctly.
-    deadline = time.time() + 15.0
+    #
+    # Deadline: 30s. The proof round-trip is a cross-impl operation
+    # (receiver decodes the data, emits a proof, sender validates it).
+    # On a local box it completes in ~6s, but on a shared 2-core CI
+    # runner the cross-impl case where the receiver is python and the
+    # sender is kotlin has exceeded a 15s budget under load - the
+    # receiver's python transport thread is starved before it emits the
+    # proof back. This is the same deadline-too-tight-for-CI-load class
+    # as the tcp_trio convergence fix (conftest.py), not an interop
+    # correctness defect: the receive phase above already proved the
+    # payload decoded correctly in every direction. 30s matches the
+    # test_direct_large.py budget.
+    ack_deadline = 30.0
+    deadline = time.time() + ack_deadline
     final_state = "unknown"
     while time.time() < deadline:
         final_state = server.message_state(message_hash)
@@ -113,7 +126,7 @@ def test_opportunistic_message_with_ack(server_impl, client_impl, pipe_pair):
 
     assert final_state == "delivered", (
         f"Server ({server_impl}) outbound message state did not reach "
-        f"'delivered' within 15s — last observed: {final_state!r}. "
-        f"Either the receiver ({client_impl}) did not emit a proof, "
-        f"or the sender did not process it."
+        f"'delivered' within {ack_deadline:.0f}s - last observed: "
+        f"{final_state!r}. Either the receiver ({client_impl}) did not "
+        f"emit a proof, or the sender did not process it."
     )
